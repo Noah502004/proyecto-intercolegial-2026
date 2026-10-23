@@ -2,16 +2,30 @@ extends Node3D
 ## ONE MORE DRINK - endless driving game about alcohol impairment (Godot 4.1+)
 ## Attach this script to a Node3D root, save the scene and press F5.
 ## Controls: A / Left = change lane left, D / Right = change lane right
-##           Enter / Space / R = start / restart
+##           Enter / Space / R = start / restart      Esc = leave lobby
 ##
-## Arcade-style logic: no physics engine, collisions are simple box overlap tests.
+## MULTIPLAYER (ENet, 2-8 players, UDP port 24680)
+##   * One player presses HOST GAME, the others type the host's IP and press JOIN.
+##     Every instance must run THIS SAME script on a root node with the same name/path.
+##   * The host starts the race with Enter. Everybody drives through the SAME traffic
+##     (the world is a pure function of a shared random seed + time), other players are
+##     shown as translucent ghost cars. Last driver standing / highest score wins.
+##   * Only position + score are sent over the network, collisions are checked locally.
+##   * To test on one PC: run two instances (Debug > Customize Run Instances) and join 127.0.0.1.
 ##
 ## FAIRNESS: traffic is generated as "rows". Every row keeps one SAFE LANE free, the safe
 ## lane can only move by one lane between two rows, and rows are spaced by *time*
-## (longer when the alcohol delay is bigger). Moving vehicles are spawned so that they
+## (longer when the alcohol delay is bigger). Moving vehicles are placed so that they
 ## reach their row exactly when the player does, so a path through the traffic always exists.
 
-enum State { MENU, PLAYING, GAME_OVER }
+enum State { MENU, LOBBY, PLAYING, GAME_OVER }
+
+# --- Network ------------------------------------------------------------------
+const PORT := 24680
+const MAX_PLAYERS := 8
+const SEND_INTERVAL := 0.05
+const GHOST_COLORS := [Color(0.2, 0.5, 1.0), Color(0.2, 0.85, 0.4), Color(1.0, 0.8, 0.15),
+		Color(0.8, 0.3, 1.0), Color(1.0, 0.5, 0.1), Color(0.2, 0.9, 0.9), Color(1.0, 0.45, 0.7)]
 
 # --- Road / player ------------------------------------------------------------
 const LANE_WIDTH := 3.5
@@ -35,6 +49,8 @@ const ROW_TIME_PER_DELAY := 1.2    # extra seconds per second of input delay
 const VEHICLE_SPEED_MIN := 6.0
 const VEHICLE_SPEED_MAX := 9.0
 const PED_SPEED := 2.4
+const VEHICLE_COLORS := [Color(0.1, 0.3, 0.8), Color(0.9, 0.9, 0.9), Color(0.1, 0.6, 0.3),
+		Color(0.9, 0.7, 0.1), Color(0.3, 0.3, 0.35)]
 
 # --- World streaming ----------------------------------------------------------
 const CHUNK_LEN := 100.0
@@ -78,7 +94,6 @@ void fragment() {
 }
 """
 
-static var auto_start := false     # survives scene reload, so restart skips the menu
 static var best_score := 0         # survives scene reload
 
 
@@ -86,7 +101,9 @@ class Hazard:
 	var node: Node3D
 	var type := 0              # 0 = vehicle, 1 = obstacle, 2 = pedestrian
 	var half := Vector2.ONE
-	var vel := Vector3.ZERO
+	var m := 0.0               # row position (z)
+	var speed := 0.0           # vehicle speed
+	var t_arrive := 0.0        # time at which a player reaches the row
 	var waiting := false       # pedestrians wait on the curb until triggered
 	var side := 1.0
 	var trigger := 2.0         # seconds before the player arrives that the pedestrian starts
@@ -117,10 +134,19 @@ var pending: Array = []        # delayed steering commands
 var cam_x := 0.0
 var over_time := 0.0           # when the game ended (restart lockout)
 
-# Traffic planning
+# Traffic planning (uses its own seeded RNG so every player gets the same road)
+var rng := RandomNumberGenerator.new()
 var rows: Array = []           # planned rows that have not been spawned yet
 var plan_z := -150.0           # z of the next row to be planned
 var safe_lane := 0             # lane that is guaranteed free in the last planned row
+
+# Network
+var online := false
+var is_host := false
+var my_name := "Player"
+var players := {}              # peer_id -> {name, score, alive, in_race, node, tx, tz, tyaw}
+var net_timer := 0.0
+var ui_timer := 0.0
 
 # HUD
 var score_label: Label
@@ -142,6 +168,7 @@ var dim: ColorRect
 var title_label: Label
 var subtitle_label: Label
 var menu_box: VBoxContainer
+var lobby_box: VBoxContainer
 var over_box: VBoxContainer
 var prompt_label: Label
 var newbest_label: Label
@@ -149,6 +176,15 @@ var stat_score: Label
 var stat_best: Label
 var stat_dist: Label
 var stat_alc: Label
+var standings_label: Label
+var lobby_list: Label
+var board_panel: PanelContainer
+var board_label: Label
+var name_edit: LineEdit
+var addr_edit: LineEdit
+var host_btn: Button
+var join_btn: Button
+var net_status: Label
 var tint: ColorRect
 var fx_rect: ColorRect
 var fx_mat: ShaderMaterial
@@ -167,13 +203,15 @@ func _ready() -> void:
 	camera.current = true
 	_build_hud()
 	_build_post_fx()
-	_update_camera(0.016)
-	_update_hud()
-	_update_spawns()
-	if auto_start:
-		_start()
-	else:
-		_show_menu()
+
+	multiplayer.peer_connected.connect(_on_peer_connected)
+	multiplayer.peer_disconnected.connect(_on_peer_disconnected)
+	multiplayer.connected_to_server.connect(_on_connected_to_server)
+	multiplayer.connection_failed.connect(_on_connection_failed)
+	multiplayer.server_disconnected.connect(_on_server_disconnected)
+
+	_reset_run(randi())
+	_show_menu()
 
 
 # ------------------------------------------------------------------------------
@@ -183,6 +221,7 @@ func _setup_inputs() -> void:
 	_add_action("steer_left", [KEY_A, KEY_LEFT])
 	_add_action("steer_right", [KEY_D, KEY_RIGHT])
 	_add_action("start", [KEY_ENTER, KEY_KP_ENTER, KEY_SPACE, KEY_R])
+	_add_action("back", [KEY_ESCAPE])
 
 
 func _add_action(action: String, keys: Array) -> void:
@@ -196,38 +235,372 @@ func _add_action(action: String, keys: Array) -> void:
 
 
 func _unhandled_input(event: InputEvent) -> void:
+	# clicking on empty space removes the focus from the text fields
+	if event is InputEventMouseButton and event.pressed:
+		get_viewport().gui_release_focus()
 	match state:
 		State.MENU:
 			if event.is_action_pressed("start"):
+				_reset_run(randi())
 				_start()
+		State.LOBBY:
+			if event.is_action_pressed("back"):
+				_leave_online()
+			elif event.is_action_pressed("start") and is_host:
+				rpc("_rpc_start", randi())
 		State.PLAYING:
 			if event.is_action_pressed("steer_left"):
 				_queue_steer(-1)
 			elif event.is_action_pressed("steer_right"):
 				_queue_steer(1)
 		State.GAME_OVER:
+			if online and event.is_action_pressed("back"):
+				_leave_online()
+				return
 			# short lockout so mashing A/D at the moment of the crash can't restart
 			if event.is_action_pressed("start") and Time.get_ticks_msec() / 1000.0 - over_time > 0.8:
-				auto_start = true
-				get_tree().reload_current_scene()
+				if not online:
+					_reset_run(randi())
+					_start()
+				elif is_host and _all_dead():
+					rpc("_rpc_start", randi())
+
+
+# ------------------------------------------------------------------------------
+# Networking
+# ------------------------------------------------------------------------------
+func _set_my_name() -> void:
+	my_name = name_edit.text.strip_edges()
+	if my_name.is_empty():
+		my_name = "Player%d" % (randi() % 900 + 100)
+
+
+func _on_host_pressed() -> void:
+	_set_my_name()
+	var peer := ENetMultiplayerPeer.new()
+	if peer.create_server(PORT, MAX_PLAYERS - 1) != OK:
+		net_status.text = "Could not host (is port %d already in use?)" % PORT
+		return
+	multiplayer.multiplayer_peer = peer
+	_clear_players()
+	online = true
+	is_host = true
+	_enter_lobby()
+
+
+func _on_join_pressed() -> void:
+	_set_my_name()
+	var addr := addr_edit.text.strip_edges()
+	if addr.is_empty():
+		addr = "127.0.0.1"
+	var peer := ENetMultiplayerPeer.new()
+	if peer.create_client(addr, PORT) != OK:
+		net_status.text = "Invalid address."
+		return
+	multiplayer.multiplayer_peer = peer
+	net_status.text = "Connecting to %s ..." % addr
+	host_btn.disabled = true
+	join_btn.disabled = true
+
+
+func _on_connected_to_server() -> void:
+	online = true
+	is_host = false
+	_enter_lobby()
+
+
+func _on_connection_failed() -> void:
+	multiplayer.multiplayer_peer = OfflineMultiplayerPeer.new()
+	host_btn.disabled = false
+	join_btn.disabled = false
+	net_status.text = "Connection failed."
+
+
+func _on_server_disconnected() -> void:
+	_leave_online("The host left the game.")
+
+
+func _on_peer_connected(id: int) -> void:
+	_ensure_player(id)
+	rpc_id(id, "_rpc_hello", my_name)   # tell the newcomer (or the host) who we are
+	_refresh_lobby()
+
+
+func _on_peer_disconnected(id: int) -> void:
+	if players.has(id):
+		_free_ghost(players[id])
+		players.erase(id)
+	_refresh_lobby()
+	if state == State.GAME_OVER:
+		_refresh_over_online()
+
+
+func _ensure_player(id: int) -> void:
+	if players.has(id):
+		return
+	players[id] = {"name": "Player", "score": 0, "alive": false, "in_race": false,
+			"node": null, "tx": 0.0, "tz": 0.0, "tyaw": 0.0}
+
+
+func _free_ghost(p: Dictionary) -> void:
+	if p["node"] != null:
+		(p["node"] as Node).queue_free()
+		p["node"] = null
+
+
+func _clear_players() -> void:
+	for id in players:
+		_free_ghost(players[id])
+	players.clear()
+
+
+func _leave_online(msg := "") -> void:
+	if multiplayer.multiplayer_peer != null:
+		multiplayer.multiplayer_peer.close()
+	multiplayer.multiplayer_peer = OfflineMultiplayerPeer.new()
+	online = false
+	is_host = false
+	_clear_players()
+	_reset_run(randi())
+	_show_menu(msg)
+
+
+@rpc("any_peer", "call_remote", "reliable")
+func _rpc_hello(pname: String) -> void:
+	var id := multiplayer.get_remote_sender_id()
+	_ensure_player(id)
+	players[id]["name"] = pname.substr(0, 12)
+	_refresh_lobby()
+
+
+# Only the host (authority) may start a race. call_local: the host starts too.
+@rpc("authority", "call_local", "reliable")
+func _rpc_start(seed_value: int) -> void:
+	_reset_run(seed_value)
+	_start()
+
+
+@rpc("any_peer", "call_remote", "unreliable")
+func _rpc_state(x: float, z: float, yaw: float, sc: int) -> void:
+	var id := multiplayer.get_remote_sender_id()
+	if not players.has(id):
+		return
+	var p: Dictionary = players[id]
+	if not p["in_race"] or not p["alive"]:
+		return
+	p["tx"] = x
+	p["tz"] = z
+	p["tyaw"] = yaw
+	p["score"] = sc
+
+
+@rpc("any_peer", "call_remote", "reliable")
+func _rpc_dead(final_score: int) -> void:
+	var id := multiplayer.get_remote_sender_id()
+	if players.has(id):
+		players[id]["alive"] = false
+		players[id]["score"] = final_score
+
+
+func _send_state(delta: float) -> void:
+	net_timer -= delta
+	if net_timer <= 0.0:
+		net_timer = SEND_INTERVAL
+		rpc("_rpc_state", player.position.x, player.position.z, player.rotation.y, score)
+
+
+func _all_dead() -> bool:
+	if state == State.PLAYING:
+		return false
+	for id in players:
+		if players[id]["in_race"] and players[id]["alive"]:
+			return false
+	return true
+
+
+# Ghost cars of the other players
+func _spawn_ghosts() -> void:
+	var ids := players.keys()
+	ids.sort()
+	for i in range(ids.size()):
+		var p: Dictionary = players[ids[i]]
+		_free_ghost(p)
+		p["in_race"] = true
+		p["alive"] = true
+		p["score"] = 0
+		p["tx"] = 0.0
+		p["tz"] = 0.0
+		p["tyaw"] = 0.0
+		var n := _make_car_model(GHOST_COLORS[i % GHOST_COLORS.size()])
+		_ghostify(n)
+		var lbl := Label3D.new()
+		lbl.text = p["name"]
+		lbl.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		lbl.no_depth_test = true
+		lbl.pixel_size = 0.012
+		lbl.font_size = 40
+		lbl.outline_size = 10
+		lbl.position = Vector3(0, 2.8, 0)
+		n.add_child(lbl)
+		add_child(n)
+		p["node"] = n
+
+
+func _ghostify(n: Node) -> void:
+	for c in n.get_children():
+		if c is MeshInstance3D:
+			var m := c.material_override as StandardMaterial3D
+			m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+			m.albedo_color.a = 0.6
+			c.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+
+
+func _update_remotes(delta: float) -> void:
+	var k := minf(1.0, delta * 10.0)
+	for id in players:
+		var p: Dictionary = players[id]
+		var n := p["node"] as Node3D
+		if n == null:
+			continue
+		n.visible = p["in_race"] and p["alive"]
+		if not n.visible:
+			continue
+		# everybody follows the same speed curve, so we can extrapolate between packets
+		p["tz"] -= _speed_at(-p["tz"]) * delta
+		n.position.x = lerpf(n.position.x, p["tx"], k)
+		n.position.z = lerpf(n.position.z, p["tz"], k)
+		n.rotation.y = lerp_angle(n.rotation.y, p["tyaw"], k)
+
+
+func _standings() -> Array:
+	var list: Array = [{"name": my_name, "score": score, "alive": state == State.PLAYING, "me": true}]
+	for id in players:
+		var p: Dictionary = players[id]
+		if p["in_race"]:
+			list.append({"name": p["name"], "score": p["score"], "alive": p["alive"], "me": false})
+	list.sort_custom(func(a, b): return a["score"] > b["score"])
+	return list
+
+
+func _standings_text() -> String:
+	var t := ""
+	var list := _standings()
+	for i in range(list.size()):
+		var e: Dictionary = list[i]
+		t += "%d.  %s  -  %d%s%s\n" % [i + 1, e["name"], e["score"],
+				"" if e["alive"] else "  (crashed)", "   < you" if e["me"] else ""]
+	return t.strip_edges()
+
+
+func _refresh_board() -> void:
+	board_label.text = _standings_text()
+
+
+func _refresh_over_online() -> void:
+	var done := _all_dead()
+	var head := "FINAL STANDINGS" if done else "STANDINGS  (race still running)"
+	standings_label.text = head + "\n" + _standings_text()
+	if done:
+		prompt_label.text = "PRESS  ENTER  TO PLAY AGAIN" if is_host else "WAITING FOR THE HOST..."
+	else:
+		prompt_label.text = "WAITING FOR OTHER DRIVERS..."
+
+
+func _local_ips() -> String:
+	var out := ""
+	var count := 0
+	for a in IP.get_local_addresses():
+		if a.count(".") == 3 and not a.begins_with("127.") and not a.begins_with("169.254."):
+			out += ("" if count == 0 else ", ") + a
+			count += 1
+			if count >= 3:
+				break
+	return out
+
+
+func _enter_lobby() -> void:
+	state = State.LOBBY
+	dim.visible = true
+	menu_box.visible = false
+	over_box.visible = false
+	lobby_box.visible = true
+	board_panel.visible = false
+	title_label.text = "LOBBY"
+	title_label.add_theme_color_override("font_color", COL_ACCENT)
+	if is_host:
+		subtitle_label.text = "Hosting on UDP port %d.\nFriends join with: %s" % [PORT, _local_ips()]
+	else:
+		subtitle_label.text = "Connected to the host."
+	_refresh_lobby()
+
+
+func _refresh_lobby() -> void:
+	if state != State.LOBBY:
+		return
+	var t := "%s  (you)%s" % [my_name, "  - host" if is_host else ""]
+	for id in players:
+		t += "\n%s%s" % [players[id]["name"], "  - host" if id == 1 else ""]
+	lobby_list.text = t
+	prompt_label.text = "PRESS  ENTER  TO START THE RACE" if is_host else "WAITING FOR THE HOST..."
 
 
 # ------------------------------------------------------------------------------
 # Game flow
 # ------------------------------------------------------------------------------
-func _show_menu() -> void:
+func _show_menu(msg := "") -> void:
+	state = State.MENU
 	dim.visible = true
 	menu_box.visible = true
+	lobby_box.visible = false
 	over_box.visible = false
+	board_panel.visible = false
+	host_btn.disabled = false
+	join_btn.disabled = false
+	net_status.text = ""
 	title_label.text = "ONE MORE DRINK"
 	title_label.add_theme_color_override("font_color", Color(1.0, 0.82, 0.35))
-	subtitle_label.text = "An endless road. A dangerous choice."
-	prompt_label.text = "PRESS  ENTER  TO START"
+	subtitle_label.text = msg if msg != "" else "An endless road. A dangerous choice."
+	prompt_label.text = "PRESS  ENTER  FOR  SOLO  PLAY"
+
+
+func _reset_run(seed_value: int) -> void:
+	rng.seed = seed_value
+	for h in hazards:
+		h.node.queue_free()
+	hazards.clear()
+	rows.clear()
+	plan_z = -150.0
+	safe_lane = 0
+	speed = START_SPEED
+	play_time = 0.0
+	score = 0
+	score_timer = 0.0
+	segments_done = 0
+	level = 0
+	drunk = 0.0
+	lane = 0
+	lane_offset = 0.0
+	pending.clear()
+	cam_x = 0.0
+	net_timer = 0.0
+	player.position = Vector3.ZERO
+	player.rotation = Vector3.ZERO
+	for i in range(chunks.size()):
+		chunks[i].position.z = 100.0 - i * CHUNK_LEN
+	ground.position.z = 0.0
+	_hud_level = -1
+	_spawn_ghosts()
+	_update_spawns()
+	_update_camera(0.016)
+	_update_hud()
 
 
 func _start() -> void:
 	state = State.PLAYING
 	dim.visible = false
+	board_panel.visible = online
+	if online:
+		_refresh_board()
 	speed = START_SPEED
 	_popup("Go! Stay on the road.", Color.WHITE)
 	hint_label.modulate.a = 1.0
@@ -247,7 +620,9 @@ func _game_over(reason: String) -> void:
 
 	dim.visible = true
 	menu_box.visible = false
+	lobby_box.visible = false
 	over_box.visible = true
+	board_panel.visible = false
 	title_label.text = "GAME OVER"
 	title_label.add_theme_color_override("font_color", Color(1.0, 0.3, 0.28))
 	subtitle_label.text = reason
@@ -256,13 +631,27 @@ func _game_over(reason: String) -> void:
 	stat_dist.text = "%d m" % int(-player.position.z)
 	stat_alc.text = "%d / 3" % level
 	newbest_label.visible = new_best
-	prompt_label.text = "PRESS  ENTER  TO TRY AGAIN"
+	standings_label.visible = online
+	if online:
+		rpc("_rpc_dead", score)
+		_refresh_over_online()
+	else:
+		prompt_label.text = "PRESS  ENTER  TO TRY AGAIN"
 
 
 func _process(delta: float) -> void:
 	delta = minf(delta, 0.05)
 	if state == State.PLAYING:
 		_update_game(delta)
+	if online:
+		_update_remotes(delta)
+		ui_timer -= delta
+		if ui_timer <= 0.0:
+			ui_timer = 0.2
+			if state == State.PLAYING:
+				_refresh_board()
+			elif state == State.GAME_OVER:
+				_refresh_over_online()
 	_update_camera(delta)
 
 
@@ -274,6 +663,8 @@ func _update_game(delta: float) -> void:
 
 	_process_steer_queue()
 	_update_player_x(delta)
+	if online:
+		_send_state(delta)
 
 	_update_spawns()
 	_update_hazards(delta)
@@ -292,6 +683,7 @@ func _update_game(delta: float) -> void:
 
 # ------------------------------------------------------------------------------
 # Steering with alcohol effects
+# (uses the global RNG on purpose: lane errors are local and must not touch the traffic RNG)
 # ------------------------------------------------------------------------------
 func _by_level(table: Array, v: float) -> float:
 	var i := clampi(int(floorf(v)), 0, table.size() - 2)
@@ -331,29 +723,32 @@ func _update_player_x(delta: float) -> void:
 
 
 # ------------------------------------------------------------------------------
-# Player motion prediction (speed only depends on time, so it is fully predictable)
+# Player motion model. Speed only depends on time and every run starts at z = 0, so
+# "distance from the start" <-> "time" is a fixed curve shared by ALL players.
 # ------------------------------------------------------------------------------
-func _time_to_cover(dist: float) -> float:
-	if dist <= 0.0:
+func _speed_at(d: float) -> float:
+	return minf(sqrt(START_SPEED * START_SPEED + 2.0 * ACCEL * maxf(d, 0.0)), MAX_SPEED)
+
+
+func _time_at(d: float) -> float:
+	if d <= 0.0:
 		return 0.0
-	var t_max := maxf((MAX_SPEED - speed) / ACCEL, 0.0)
-	var d_max := speed * t_max + 0.5 * ACCEL * t_max * t_max
-	if dist <= d_max:
-		return (sqrt(speed * speed + 2.0 * ACCEL * dist) - speed) / ACCEL
-	return t_max + (dist - d_max) / MAX_SPEED
-
-
-func _speed_after(dist: float) -> float:
-	return minf(sqrt(speed * speed + 2.0 * ACCEL * maxf(dist, 0.0)), MAX_SPEED)
+	var t_max := (MAX_SPEED - START_SPEED) / ACCEL
+	var d_max := START_SPEED * t_max + 0.5 * ACCEL * t_max * t_max
+	if d <= d_max:
+		return (sqrt(START_SPEED * START_SPEED + 2.0 * ACCEL * d) - START_SPEED) / ACCEL
+	return t_max + (d - d_max) / MAX_SPEED
 
 
 # ------------------------------------------------------------------------------
-# Traffic planning: rows that always leave a reachable safe lane
+# Traffic planning: rows that always leave a reachable safe lane.
+# Everything in here uses `rng` and depends only on the row position, never on the
+# player, so every player generates exactly the same rows from the same seed.
 # ------------------------------------------------------------------------------
 func _update_spawns() -> void:
 	_plan_rows()
 	for i in range(rows.size() - 1, -1, -1):
-		if _row_start_dist(rows[i]) <= SPAWN_AHEAD:
+		if _row_ready(rows[i]):
 			_spawn_row(rows[i])
 			rows.remove_at(i)
 
@@ -367,17 +762,18 @@ func _plan_rows() -> void:
 # Distance (in metres) to the next row. It is measured in TIME so the player always has
 # enough seconds to change lanes, even with the input delay of a higher alcohol level.
 func _row_gap(m: float) -> float:
-	var d := player.position.z - m
-	var s_arr := _speed_after(d + 60.0)
+	var s_arr := _speed_at(-m + 60.0)
 	var lvl := clampi(int(-(m - 60.0) / SEGMENT_LENGTH), 0, 3)
-	var t: float = ROW_TIME + ROW_TIME_PER_DELAY * DELAY[lvl] + randf_range(0.0, 0.8)
+	var t: float = ROW_TIME + ROW_TIME_PER_DELAY * DELAY[lvl] + rng.randf_range(0.0, 0.8)
 	return maxf(MIN_GAP, s_arr * t)
 
 
 func _make_row(m: float) -> Dictionary:
-	var row := {"m": m, "has_vehicle": false, "vehicle_lane": 0, "v": 0.0,
-			"obstacles": [], "ped_side": 0.0}
-	var r := randf()
+	var row := {"m": m, "T": _time_at(-m), "has_vehicle": false, "vehicle_lane": 0, "v": 0.0,
+			"color": rng.randi() % VEHICLE_COLORS.size(), "obstacles": [],
+			"ped_side": 0.0, "ped_trigger": rng.randf_range(1.2, 2.4),
+			"ped_hue": rng.randf(), "ped_phase": rng.randf() * TAU}
+	var r := rng.randf()
 	if r < 0.22:
 		# Pedestrian crossing from one curb. The lane on the far side of the road
 		# always stays free, so that is this row's safe lane.
@@ -385,7 +781,7 @@ func _make_row(m: float) -> Dictionary:
 		for sd in [-1, 1]:
 			if abs(-sd - safe_lane) <= 1:
 				sides.append(sd)
-		var side := float(sides[randi() % sides.size()])
+		var side := float(sides[rng.randi() % sides.size()])
 		row["ped_side"] = side
 		safe_lane = int(-side)
 		return row
@@ -395,72 +791,77 @@ func _make_row(m: float) -> Dictionary:
 	for l in range(-1, 2):
 		if absi(l - safe_lane) <= 1:
 			opts.append(l)
-	safe_lane = opts[randi() % opts.size()]
+	safe_lane = opts[rng.randi() % opts.size()]
 	var others: Array = []
 	for l in range(-1, 2):
 		if l != safe_lane:
 			others.append(l)
-	others.shuffle()
+	if rng.randf() < 0.5:
+		others.reverse()
 
 	if r < 0.50:                                   # slow vehicle
 		row["has_vehicle"] = true
 		row["vehicle_lane"] = others[0]
-		row["v"] = randf_range(VEHICLE_SPEED_MIN, VEHICLE_SPEED_MAX)
+		row["v"] = rng.randf_range(VEHICLE_SPEED_MIN, VEHICLE_SPEED_MAX)
 	elif r < 0.78:                                 # obstacle(s)
-		row["obstacles"].append([others[0], 0.0])
-		if randf() < 0.4:
-			row["obstacles"].append([others[1], 0.0])
+		row["obstacles"].append([others[0], 0.0, rng.randi() % 3])
+		if rng.randf() < 0.4:
+			row["obstacles"].append([others[1], 0.0, rng.randi() % 3])
 	else:                                          # vehicle + obstacle
 		row["has_vehicle"] = true
 		row["vehicle_lane"] = others[0]
-		row["v"] = randf_range(VEHICLE_SPEED_MIN, VEHICLE_SPEED_MAX)
-		row["obstacles"].append([others[1], randf_range(-3.0, 3.0)])
+		row["v"] = rng.randf_range(VEHICLE_SPEED_MIN, VEHICLE_SPEED_MAX)
+		row["obstacles"].append([others[1], rng.randf_range(-3.0, 3.0), rng.randi() % 3])
 	return row
 
 
-# How far from the player the row's first object would appear. Vehicles drive forward,
-# so they start closer to the player than the row position.
-func _row_start_dist(row: Dictionary) -> float:
-	var d: float = player.position.z - float(row["m"])
-	var v: float = row["v"]
-	return d - v * _time_to_cover(d)
+# A row is spawned when its first object (the vehicle, if any) is SPAWN_AHEAD metres away.
+func _row_ready(row: Dictionary) -> bool:
+	var z_first: float = row["m"]
+	if row["has_vehicle"]:
+		z_first = _vehicle_z(row["m"], row["v"], row["T"])
+	return player.position.z - z_first <= SPAWN_AHEAD
+
+
+# Vehicles are a pure function of time: they are exactly at z = m when a player arrives.
+func _vehicle_z(m: float, v: float, t_arrive: float) -> float:
+	return m + v * (t_arrive - play_time)
 
 
 func _spawn_row(row: Dictionary) -> void:
 	var m: float = row["m"]
 	if row["has_vehicle"]:
-		_spawn_vehicle(row["vehicle_lane"], m, row["v"])
+		_spawn_vehicle(row)
 	for ob in row["obstacles"]:
-		_spawn_obstacle(ob[0], m + ob[1])
+		_spawn_obstacle(ob[0], m + ob[1], ob[2])
 	if row["ped_side"] != 0.0:
-		_spawn_pedestrian(m, row["ped_side"])
+		_spawn_pedestrian(row)
 
 
 # ------------------------------------------------------------------------------
 # Hazards
 # ------------------------------------------------------------------------------
-func _spawn_vehicle(lane_i: int, m: float, v: float) -> void:
+func _spawn_vehicle(row: Dictionary) -> void:
 	var h := Hazard.new()
 	h.type = 0
 	h.half = Vector2(0.9, 2.0)
 	h.reason = "You crashed into another vehicle."
-	var colors := [Color(0.1, 0.3, 0.8), Color(0.9, 0.9, 0.9), Color(0.1, 0.6, 0.3),
-			Color(0.9, 0.7, 0.1), Color(0.3, 0.3, 0.35)]
-	h.node = _make_car_model(colors[randi() % colors.size()])
-	# start position chosen so the vehicle is exactly at z = m when the player gets there
-	var z0 := m + v * _time_to_cover(player.position.z - m)
-	h.node.position = Vector3(lane_i * LANE_WIDTH, 0.0, z0)
-	h.vel = Vector3(0, 0, -v)
+	h.m = row["m"]
+	h.speed = row["v"]
+	h.t_arrive = row["T"]
+	h.node = _make_car_model(VEHICLE_COLORS[row["color"]])
+	h.node.position = Vector3(int(row["vehicle_lane"]) * LANE_WIDTH, 0.0,
+			_vehicle_z(h.m, h.speed, h.t_arrive))
 	add_child(h.node)
 	hazards.append(h)
 
 
-func _spawn_obstacle(lane_i: int, z: float) -> void:
+func _spawn_obstacle(lane_i: int, z: float, kind: int) -> void:
 	var h := Hazard.new()
 	h.type = 1
 	h.reason = "You hit an obstacle."
 	var n := Node3D.new()
-	match randi() % 3:
+	match kind:
 		0:  # barrel
 			_add_cyl(n, 0.45, 1.0, Vector3(0, 0.5, 0), Color(0.9, 0.4, 0.1))
 			_add_cyl(n, 0.46, 0.15, Vector3(0, 0.5, 0), Color(0.95, 0.95, 0.95))
@@ -481,17 +882,19 @@ func _spawn_obstacle(lane_i: int, z: float) -> void:
 	hazards.append(h)
 
 
-func _spawn_pedestrian(z: float, side: float) -> void:
+func _spawn_pedestrian(row: Dictionary) -> void:
 	var h := Hazard.new()
 	h.type = 2
 	h.half = Vector2(0.35, 0.35)
 	h.reason = "You hit a pedestrian."
 	h.waiting = true
-	h.side = side
-	h.trigger = randf_range(1.2, 2.4)   # keeps the far-side lane clear when the car arrives
-	h.phase = randf() * TAU
+	h.side = row["ped_side"]
+	h.m = row["m"]
+	h.t_arrive = row["T"]
+	h.trigger = row["ped_trigger"]   # keeps the far-side lane clear when the car arrives
+	h.phase = row["ped_phase"]
 	var n := Node3D.new()
-	var col := Color.from_hsv(randf(), 0.6, 0.9)
+	var col := Color.from_hsv(row["ped_hue"], 0.6, 0.9)
 	var body := MeshInstance3D.new()
 	var cap := CapsuleMesh.new()
 	cap.radius = 0.25
@@ -508,7 +911,7 @@ func _spawn_pedestrian(z: float, side: float) -> void:
 	head.material_override = _mat(Color(0.9, 0.75, 0.6))
 	head.position.y = 1.8
 	n.add_child(head)
-	n.position = Vector3(h.side * 6.5, 0.1, z)
+	n.position = Vector3(h.side * 6.5, 0.1, h.m)
 	h.node = n
 	add_child(n)
 	hazards.append(h)
@@ -519,17 +922,16 @@ func _update_hazards(delta: float) -> void:
 		var h: Hazard = hazards[i]
 		var n := h.node
 
-		# Pedestrians start crossing when the player is `trigger` seconds away
-		if h.type == 2:
-			if h.waiting and _time_to_cover(player.position.z - n.position.z) <= h.trigger:
-				h.waiting = false
-				h.vel = Vector3(-h.side * PED_SPEED, 0, 0)
+		if h.type == 0:
+			n.position.z = _vehicle_z(h.m, h.speed, h.t_arrive)
+		elif h.type == 2:
+			# Pedestrians start crossing `trigger` seconds before a player arrives
+			var t0 := h.t_arrive - h.trigger
+			h.waiting = play_time < t0
 			if not h.waiting:
+				var walked := PED_SPEED * (play_time - t0)
+				n.position.x = clampf(h.side * 6.5 - h.side * walked, -7.2, 7.2)
 				n.position.y = 0.1 + absf(sin(play_time * 9.0 + h.phase)) * 0.08
-				if (h.side > 0.0 and n.position.x < -7.2) or (h.side < 0.0 and n.position.x > 7.2):
-					h.vel = Vector3.ZERO
-
-		n.position += h.vel * delta
 
 		var dx := n.position.x - player.position.x
 		var dz := n.position.z - player.position.z
@@ -683,6 +1085,16 @@ func _stat_tile(parent: Control, caption: String) -> Label:
 	return val
 
 
+func _button(text: String, handler: Callable) -> Button:
+	var b := Button.new()
+	b.text = text
+	b.focus_mode = Control.FOCUS_NONE      # so Enter / Space never "click" it
+	b.custom_minimum_size = Vector2(170, 44)
+	b.add_theme_font_size_override("font_size", 20)
+	b.pressed.connect(handler)
+	return b
+
+
 # ------------------------------------------------------------------------------
 # HUD
 # ------------------------------------------------------------------------------
@@ -771,6 +1183,16 @@ func _build_hud() -> void:
 	speed_fill = speed_bar.get_theme_stylebox("fill") as StyleBoxFlat
 	var rcap := _label("SPEED", 14, COL_MUTED, HORIZONTAL_ALIGNMENT_RIGHT)
 	rv.add_child(rcap)
+
+	# ---- multiplayer scoreboard (top left, below the score panel) --------------
+	board_panel = PanelContainer.new()
+	board_panel.add_theme_stylebox_override("panel", _style(COL_PANEL, COL_BORDER, 14, 1, 12))
+	board_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.add_child(board_panel)
+	board_panel.position = Vector2(20, 180)
+	board_label = _label("", 18, Color.WHITE)
+	board_panel.add_child(board_label)
+	board_panel.visible = false
 
 	# ---- popup banner ----------------------------------------------------------
 	var pop_margin := MarginContainer.new()
@@ -869,6 +1291,48 @@ func _build_overlay(root: Control) -> void:
 		"Crashing, hitting a pedestrian or leaving the road ends the run.\nThe farther you drive, the more you drink.",
 		18, Color(1, 0.7, 0.35), HORIZONTAL_ALIGNMENT_CENTER))
 
+	# multiplayer section
+	menu_box.add_child(HSeparator.new())
+	menu_box.add_child(_label("MULTIPLAYER  -  same traffic for everyone, last driver standing wins",
+			16, COL_ACCENT, HORIZONTAL_ALIGNMENT_CENTER))
+	var fields := HBoxContainer.new()
+	fields.alignment = BoxContainer.ALIGNMENT_CENTER
+	fields.add_theme_constant_override("separation", 10)
+	menu_box.add_child(fields)
+	name_edit = LineEdit.new()
+	name_edit.text = "Player%d" % (randi() % 900 + 100)
+	name_edit.placeholder_text = "Your name"
+	name_edit.max_length = 12
+	name_edit.custom_minimum_size = Vector2(170, 40)
+	name_edit.text_submitted.connect(func(_t): name_edit.release_focus())
+	fields.add_child(name_edit)
+	addr_edit = LineEdit.new()
+	addr_edit.text = "127.0.0.1"
+	addr_edit.placeholder_text = "Host IP"
+	addr_edit.custom_minimum_size = Vector2(200, 40)
+	addr_edit.text_submitted.connect(func(_t): addr_edit.release_focus(); _on_join_pressed())
+	fields.add_child(addr_edit)
+	var btns := HBoxContainer.new()
+	btns.alignment = BoxContainer.ALIGNMENT_CENTER
+	btns.add_theme_constant_override("separation", 10)
+	menu_box.add_child(btns)
+	host_btn = _button("HOST GAME", _on_host_pressed)
+	btns.add_child(host_btn)
+	join_btn = _button("JOIN", _on_join_pressed)
+	btns.add_child(join_btn)
+	net_status = _label("", 18, Color(1, 0.7, 0.35), HORIZONTAL_ALIGNMENT_CENTER)
+	menu_box.add_child(net_status)
+
+	# ---- lobby content ---------------------------------------------------------
+	lobby_box = VBoxContainer.new()
+	lobby_box.add_theme_constant_override("separation", 10)
+	box.add_child(lobby_box)
+	lobby_box.add_child(_label("PLAYERS", 14, COL_MUTED, HORIZONTAL_ALIGNMENT_CENTER))
+	lobby_list = _label("", 26, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER)
+	lobby_box.add_child(lobby_list)
+	lobby_box.add_child(_label("ESC  -  leave lobby", 16, COL_MUTED, HORIZONTAL_ALIGNMENT_CENTER))
+	lobby_box.visible = false
+
 	# ---- game over content -----------------------------------------------------
 	over_box = VBoxContainer.new()
 	over_box.add_theme_constant_override("separation", 14)
@@ -884,6 +1348,9 @@ func _build_overlay(root: Control) -> void:
 	stat_alc = _stat_tile(grid, "ALCOHOL LEVEL")
 	newbest_label = _label("NEW BEST SCORE!", 24, Color(1, 0.85, 0.3), HORIZONTAL_ALIGNMENT_CENTER)
 	over_box.add_child(newbest_label)
+	standings_label = _label("", 20, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER)
+	standings_label.visible = false
+	over_box.add_child(standings_label)
 	var msg := _label("Alcohol slows your reactions, narrows your vision and ruins your judgement.\nIt is never worth the risk. Don't drink and drive.",
 			18, COL_MUTED, HORIZONTAL_ALIGNMENT_CENTER)
 	msg.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -963,6 +1430,7 @@ func _build_post_fx() -> void:
 
 # ------------------------------------------------------------------------------
 # World building (endless road = chunks recycled in front of the player)
+# Scenery uses the global RNG: it is purely cosmetic and may differ between players.
 # ------------------------------------------------------------------------------
 func _build_world() -> void:
 	var env := Environment.new()
