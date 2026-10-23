@@ -5,6 +5,11 @@ extends Node3D
 ##           Enter / Space / R = start / restart
 ##
 ## Arcade-style logic: no physics engine, collisions are simple box overlap tests.
+##
+## FAIRNESS: traffic is generated as "rows". Every row keeps one SAFE LANE free, the safe
+## lane can only move by one lane between two rows, and rows are spaced by *time*
+## (longer when the alcohol delay is bigger). Moving vehicles are spawned so that they
+## reach their row exactly when the player does, so a path through the traffic always exists.
 
 enum State { MENU, PLAYING, GAME_OVER }
 
@@ -22,8 +27,13 @@ const ACCEL := 0.4                 # m/s gained per second
 const SEGMENT_LENGTH := 700.0      # metres per route segment (+50 pts, +1 alcohol level)
 
 # --- Traffic ------------------------------------------------------------------
-const SPAWN_AHEAD := 190.0
-const MIN_GAP := 22.0
+const SPAWN_AHEAD := 220.0         # hazards appear this far ahead (hidden by fog)
+const PLAN_AHEAD := 480.0          # how far ahead rows are planned
+const MIN_GAP := 24.0              # minimum metres between two rows
+const ROW_TIME := 1.6              # base seconds between two rows
+const ROW_TIME_PER_DELAY := 1.2    # extra seconds per second of input delay
+const VEHICLE_SPEED_MIN := 6.0
+const VEHICLE_SPEED_MAX := 9.0
 const PED_SPEED := 2.4
 
 # --- World streaming ----------------------------------------------------------
@@ -33,8 +43,9 @@ const BASE_FOV := 68.0
 
 # --- Alcohol tuning, indexed by level 0..3 (values are interpolated smoothly) ---
 const DELAY := [0.0, 0.18, 0.28, 0.55]      # seconds of input delay
-const LANE_ERR := [0.0, 0.0, 0.7, 1.3]      # random lane-change error in metres
-const SWAY := [0.0, 0.0, 0.0, 0.5]          # slow involuntary drifting in metres
+const LANE_ERR := [0.0, 0.0, 0.7, 1.0]      # random lane-change error in metres
+const SWAY := [0.0, 0.0, 0.0, 0.35]         # slow involuntary drifting in metres
+const STATE_NAMES := ["SOBER", "BUZZED", "DRUNK", "WASTED"]
 const LEVEL_MSGS := [
 	"",
 	"Alcohol level 1\nYour reactions are getting slower...",
@@ -42,6 +53,12 @@ const LEVEL_MSGS := [
 	"Alcohol level 3\nBlurred, narrow vision. Delayed reactions.",
 ]
 const LEVEL_COLORS := [Color.WHITE, Color(1, 0.9, 0.3), Color(1, 0.6, 0.2), Color(1, 0.25, 0.2)]
+
+# --- UI palette ---------------------------------------------------------------
+const COL_PANEL := Color(0.04, 0.05, 0.09, 0.78)
+const COL_BORDER := Color(1, 1, 1, 0.14)
+const COL_MUTED := Color(0.66, 0.71, 0.8)
+const COL_ACCENT := Color(0.4, 0.8, 1.0)
 
 const FX_SHADER := """
 shader_type canvas_item;
@@ -97,20 +114,45 @@ var drunk := 0.0               # smoothed alcohol level (0..3)
 var lane := 0
 var lane_offset := 0.0
 var pending: Array = []        # delayed steering commands
-var spawn_z := -100.0
 var cam_x := 0.0
 var over_time := 0.0           # when the game ended (restart lockout)
 
+# Traffic planning
+var rows: Array = []           # planned rows that have not been spawned yet
+var plan_z := -150.0           # z of the next row to be planned
+var safe_lane := 0             # lane that is guaranteed free in the last planned row
+
 # HUD
 var score_label: Label
+var segment_label: Label
+var route_bar: ProgressBar
 var speed_label: Label
-var alcohol_label: Label
+var speed_bar: ProgressBar
+var speed_fill: StyleBoxFlat
+var alc_state_label: Label
+var alc_panel_style: StyleBoxFlat
+var alc_styles: Array = []
+var popup_panel: PanelContainer
+var popup_style: StyleBoxFlat
 var popup_label: Label
-var center_label: Label
+var popup_tween: Tween
+var hint_label: Label
+var flash: ColorRect
 var dim: ColorRect
+var title_label: Label
+var subtitle_label: Label
+var menu_box: VBoxContainer
+var over_box: VBoxContainer
+var prompt_label: Label
+var newbest_label: Label
+var stat_score: Label
+var stat_best: Label
+var stat_dist: Label
+var stat_alc: Label
+var tint: ColorRect
 var fx_rect: ColorRect
 var fx_mat: ShaderMaterial
-var popup_tween: Tween
+var _hud_level := -1
 
 
 func _ready() -> void:
@@ -127,6 +169,7 @@ func _ready() -> void:
 	_build_post_fx()
 	_update_camera(0.016)
 	_update_hud()
+	_update_spawns()
 	if auto_start:
 		_start()
 	else:
@@ -174,16 +217,23 @@ func _unhandled_input(event: InputEvent) -> void:
 # ------------------------------------------------------------------------------
 func _show_menu() -> void:
 	dim.visible = true
-	center_label.visible = true
-	center_label.text = "ONE MORE DRINK\n\nSurvive the road. Avoid cars, obstacles and pedestrians.\nThe farther you go, the more you drink.\n\nA / D  or  Left / Right  -  change lane\n\n+1 pt per second   +10 close call   +50 segment completed\nCrash, hit a pedestrian or leave the road = GAME OVER\n\nPress ENTER to start"
+	menu_box.visible = true
+	over_box.visible = false
+	title_label.text = "ONE MORE DRINK"
+	title_label.add_theme_color_override("font_color", Color(1.0, 0.82, 0.35))
+	subtitle_label.text = "An endless road. A dangerous choice."
+	prompt_label.text = "PRESS  ENTER  TO START"
 
 
 func _start() -> void:
 	state = State.PLAYING
 	dim.visible = false
-	center_label.visible = false
 	speed = START_SPEED
 	_popup("Go! Stay on the road.", Color.WHITE)
+	hint_label.modulate.a = 1.0
+	var ht := create_tween()
+	ht.tween_interval(5.0)
+	ht.tween_property(hint_label, "modulate:a", 0.0, 1.0)
 
 
 func _game_over(reason: String) -> void:
@@ -191,10 +241,22 @@ func _game_over(reason: String) -> void:
 	over_time = Time.get_ticks_msec() / 1000.0
 	var new_best := score > best_score
 	best_score = maxi(best_score, score)
+
+	flash.color.a = 0.55
+	create_tween().tween_property(flash, "color:a", 0.0, 0.7)
+
 	dim.visible = true
-	center_label.visible = true
-	center_label.text = "GAME OVER\n%s\n\nScore: %d%s   (Best: %d)\nDistance: %d m\nAlcohol level reached: %d / 3\n\nAlcohol slows reactions, narrows vision and ruins judgement.\nIt is never worth the risk. Don't drink and drive.\n\nPress ENTER to try again" % [
-		reason, score, "  NEW BEST!" if new_best else "", best_score, int(-player.position.z), level]
+	menu_box.visible = false
+	over_box.visible = true
+	title_label.text = "GAME OVER"
+	title_label.add_theme_color_override("font_color", Color(1.0, 0.3, 0.28))
+	subtitle_label.text = reason
+	stat_score.text = str(score)
+	stat_best.text = str(best_score)
+	stat_dist.text = "%d m" % int(-player.position.z)
+	stat_alc.text = "%d / 3" % level
+	newbest_label.visible = new_best
+	prompt_label.text = "PRESS  ENTER  TO TRY AGAIN"
 
 
 func _process(delta: float) -> void:
@@ -213,7 +275,7 @@ func _update_game(delta: float) -> void:
 	_process_steer_queue()
 	_update_player_x(delta)
 
-	_spawn_hazards()
+	_update_spawns()
 	_update_hazards(delta)
 	if state != State.PLAYING:
 		return
@@ -269,33 +331,115 @@ func _update_player_x(delta: float) -> void:
 
 
 # ------------------------------------------------------------------------------
+# Player motion prediction (speed only depends on time, so it is fully predictable)
+# ------------------------------------------------------------------------------
+func _time_to_cover(dist: float) -> float:
+	if dist <= 0.0:
+		return 0.0
+	var t_max := maxf((MAX_SPEED - speed) / ACCEL, 0.0)
+	var d_max := speed * t_max + 0.5 * ACCEL * t_max * t_max
+	if dist <= d_max:
+		return (sqrt(speed * speed + 2.0 * ACCEL * dist) - speed) / ACCEL
+	return t_max + (dist - d_max) / MAX_SPEED
+
+
+func _speed_after(dist: float) -> float:
+	return minf(sqrt(speed * speed + 2.0 * ACCEL * maxf(dist, 0.0)), MAX_SPEED)
+
+
+# ------------------------------------------------------------------------------
+# Traffic planning: rows that always leave a reachable safe lane
+# ------------------------------------------------------------------------------
+func _update_spawns() -> void:
+	_plan_rows()
+	for i in range(rows.size() - 1, -1, -1):
+		if _row_start_dist(rows[i]) <= SPAWN_AHEAD:
+			_spawn_row(rows[i])
+			rows.remove_at(i)
+
+
+func _plan_rows() -> void:
+	while player.position.z - plan_z < PLAN_AHEAD:
+		rows.append(_make_row(plan_z))
+		plan_z -= _row_gap(plan_z)
+
+
+# Distance (in metres) to the next row. It is measured in TIME so the player always has
+# enough seconds to change lanes, even with the input delay of a higher alcohol level.
+func _row_gap(m: float) -> float:
+	var d := player.position.z - m
+	var s_arr := _speed_after(d + 60.0)
+	var lvl := clampi(int(-(m - 60.0) / SEGMENT_LENGTH), 0, 3)
+	var t: float = ROW_TIME + ROW_TIME_PER_DELAY * DELAY[lvl] + randf_range(0.0, 0.8)
+	return maxf(MIN_GAP, s_arr * t)
+
+
+func _make_row(m: float) -> Dictionary:
+	var row := {"m": m, "has_vehicle": false, "vehicle_lane": 0, "v": 0.0,
+			"obstacles": [], "ped_side": 0.0}
+	var r := randf()
+	if r < 0.22:
+		# Pedestrian crossing from one curb. The lane on the far side of the road
+		# always stays free, so that is this row's safe lane.
+		var sides: Array = []
+		for sd in [-1, 1]:
+			if abs(-sd - safe_lane) <= 1:
+				sides.append(sd)
+		var side := float(sides[randi() % sides.size()])
+		row["ped_side"] = side
+		safe_lane = int(-side)
+		return row
+
+	# Pick the safe lane (max. one lane away from the previous safe lane)
+	var opts: Array = []
+	for l in range(-1, 2):
+		if absi(l - safe_lane) <= 1:
+			opts.append(l)
+	safe_lane = opts[randi() % opts.size()]
+	var others: Array = []
+	for l in range(-1, 2):
+		if l != safe_lane:
+			others.append(l)
+	others.shuffle()
+
+	if r < 0.50:                                   # slow vehicle
+		row["has_vehicle"] = true
+		row["vehicle_lane"] = others[0]
+		row["v"] = randf_range(VEHICLE_SPEED_MIN, VEHICLE_SPEED_MAX)
+	elif r < 0.78:                                 # obstacle(s)
+		row["obstacles"].append([others[0], 0.0])
+		if randf() < 0.4:
+			row["obstacles"].append([others[1], 0.0])
+	else:                                          # vehicle + obstacle
+		row["has_vehicle"] = true
+		row["vehicle_lane"] = others[0]
+		row["v"] = randf_range(VEHICLE_SPEED_MIN, VEHICLE_SPEED_MAX)
+		row["obstacles"].append([others[1], randf_range(-3.0, 3.0)])
+	return row
+
+
+# How far from the player the row's first object would appear. Vehicles drive forward,
+# so they start closer to the player than the row position.
+func _row_start_dist(row: Dictionary) -> float:
+	var d: float = player.position.z - float(row["m"])
+	var v: float = row["v"]
+	return d - v * _time_to_cover(d)
+
+
+func _spawn_row(row: Dictionary) -> void:
+	var m: float = row["m"]
+	if row["has_vehicle"]:
+		_spawn_vehicle(row["vehicle_lane"], m, row["v"])
+	for ob in row["obstacles"]:
+		_spawn_obstacle(ob[0], m + ob[1])
+	if row["ped_side"] != 0.0:
+		_spawn_pedestrian(m, row["ped_side"])
+
+
+# ------------------------------------------------------------------------------
 # Hazards
 # ------------------------------------------------------------------------------
-func _spawn_hazards() -> void:
-	var horizon := player.position.z - SPAWN_AHEAD
-	while spawn_z > horizon:
-		_spawn_row(spawn_z)
-		spawn_z -= maxf(MIN_GAP, speed * randf_range(1.2, 2.0))
-
-
-func _spawn_row(z: float) -> void:
-	var lanes := [-1, 0, 1]
-	lanes.shuffle()
-	var r := randf()
-	if r < 0.4:
-		_spawn_vehicle(lanes[0], z)
-	elif r < 0.65:
-		_spawn_obstacle(lanes[0], z)
-		if randf() < 0.3:
-			_spawn_obstacle(lanes[1], z)      # third lane always stays free
-	elif r < 0.85:
-		_spawn_pedestrian(z)
-	else:
-		_spawn_vehicle(lanes[0], z)
-		_spawn_obstacle(lanes[1], z + randf_range(-6.0, 6.0))
-
-
-func _spawn_vehicle(lane_i: int, z: float) -> void:
+func _spawn_vehicle(lane_i: int, m: float, v: float) -> void:
 	var h := Hazard.new()
 	h.type = 0
 	h.half = Vector2(0.9, 2.0)
@@ -303,8 +447,10 @@ func _spawn_vehicle(lane_i: int, z: float) -> void:
 	var colors := [Color(0.1, 0.3, 0.8), Color(0.9, 0.9, 0.9), Color(0.1, 0.6, 0.3),
 			Color(0.9, 0.7, 0.1), Color(0.3, 0.3, 0.35)]
 	h.node = _make_car_model(colors[randi() % colors.size()])
-	h.node.position = Vector3(lane_i * LANE_WIDTH, 0.0, z)
-	h.vel = Vector3(0, 0, -randf_range(7.0, 12.0))    # slower traffic, same direction
+	# start position chosen so the vehicle is exactly at z = m when the player gets there
+	var z0 := m + v * _time_to_cover(player.position.z - m)
+	h.node.position = Vector3(lane_i * LANE_WIDTH, 0.0, z0)
+	h.vel = Vector3(0, 0, -v)
 	add_child(h.node)
 	hazards.append(h)
 
@@ -323,26 +469,26 @@ func _spawn_obstacle(lane_i: int, z: float) -> void:
 			var cone := _add_cyl(n, 0.35, 0.9, Vector3(0, 0.45, 0), Color(1.0, 0.45, 0.0))
 			(cone.mesh as CylinderMesh).top_radius = 0.03
 			h.half = Vector2(0.35, 0.35)
-		_:  # road barrier
-			_add_box(n, Vector3(2.6, 0.9, 0.4), Vector3(0, 0.75, 0), Color(0.9, 0.9, 0.9))
-			_add_box(n, Vector3(2.6, 0.25, 0.41), Vector3(0, 0.9, 0), Color(0.9, 0.1, 0.1))
-			_add_box(n, Vector3(0.15, 0.6, 0.15), Vector3(-1.1, 0.3, 0), Color(0.3, 0.3, 0.3))
-			_add_box(n, Vector3(0.15, 0.6, 0.15), Vector3(1.1, 0.3, 0), Color(0.3, 0.3, 0.3))
-			h.half = Vector2(1.3, 0.3)
+		_:  # road barrier (2 m wide)
+			_add_box(n, Vector3(2.0, 0.9, 0.4), Vector3(0, 0.75, 0), Color(0.9, 0.9, 0.9))
+			_add_box(n, Vector3(2.0, 0.25, 0.41), Vector3(0, 0.9, 0), Color(0.9, 0.1, 0.1))
+			_add_box(n, Vector3(0.15, 0.6, 0.15), Vector3(-0.8, 0.3, 0), Color(0.3, 0.3, 0.3))
+			_add_box(n, Vector3(0.15, 0.6, 0.15), Vector3(0.8, 0.3, 0), Color(0.3, 0.3, 0.3))
+			h.half = Vector2(1.0, 0.3)
 	n.position = Vector3(lane_i * LANE_WIDTH, 0.0, z)
 	h.node = n
 	add_child(n)
 	hazards.append(h)
 
 
-func _spawn_pedestrian(z: float) -> void:
+func _spawn_pedestrian(z: float, side: float) -> void:
 	var h := Hazard.new()
 	h.type = 2
 	h.half = Vector2(0.35, 0.35)
 	h.reason = "You hit a pedestrian."
 	h.waiting = true
-	h.side = 1.0 if randf() < 0.5 else -1.0
-	h.trigger = randf_range(1.6, 3.4)
+	h.side = side
+	h.trigger = randf_range(1.2, 2.4)   # keeps the far-side lane clear when the car arrives
 	h.phase = randf() * TAU
 	var n := Node3D.new()
 	var col := Color.from_hsv(randf(), 0.6, 0.9)
@@ -373,9 +519,9 @@ func _update_hazards(delta: float) -> void:
 		var h: Hazard = hazards[i]
 		var n := h.node
 
-		# Pedestrians start crossing when the player gets close
+		# Pedestrians start crossing when the player is `trigger` seconds away
 		if h.type == 2:
-			if h.waiting and player.position.z - n.position.z < speed * h.trigger:
+			if h.waiting and _time_to_cover(player.position.z - n.position.z) <= h.trigger:
 				h.waiting = false
 				h.vel = Vector3(-h.side * PED_SPEED, 0, 0)
 			if not h.waiting:
@@ -437,7 +583,7 @@ func _update_progress(delta: float) -> void:
 
 
 # ------------------------------------------------------------------------------
-# Camera + post effects (wobble, FOV, blur)
+# Camera + post effects (wobble, FOV, blur, tint)
 # ------------------------------------------------------------------------------
 func _update_camera(delta: float) -> void:
 	var k2 := clampf(drunk - 1.0, 0.0, 2.0)    # wobble: small at lvl 2, bigger at lvl 3
@@ -453,6 +599,10 @@ func _update_camera(delta: float) -> void:
 	var target_fov := BASE_FOV + clampf((speed - START_SPEED) * 0.2, 0.0, 8.0) - 22.0 * k3
 	camera.fov = lerpf(camera.fov, target_fov, minf(1.0, delta * 3.0))
 
+	# warm screen tint that grows with every drink (visible cue from level 1 on)
+	var kd := clampf(drunk / 3.0, 0.0, 1.0)
+	tint.color = Color(1.0, lerpf(0.75, 0.3, kd), 0.25, kd * 0.12)
+
 	fx_rect.visible = k3 > 0.01
 	fx_mat.set_shader_parameter("blur", k3 * 2.4)
 	fx_mat.set_shader_parameter("split", k3 * 0.007)
@@ -460,73 +610,344 @@ func _update_camera(delta: float) -> void:
 
 
 # ------------------------------------------------------------------------------
-# HUD
+# UI helpers
 # ------------------------------------------------------------------------------
-func _make_label(font_size: int, align: HorizontalAlignment) -> Label:
+func _style(bg: Color, border: Color, radius := 12, border_w := 1, margin := 12) -> StyleBoxFlat:
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = bg
+	sb.border_color = border
+	sb.set_border_width_all(border_w)
+	sb.set_corner_radius_all(radius)
+	sb.set_content_margin_all(margin)
+	if border_w > 0:
+		sb.shadow_color = Color(0, 0, 0, 0.35)
+		sb.shadow_size = 6
+	return sb
+
+
+func _label(text: String, font_size: int, color := Color.WHITE,
+		align: HorizontalAlignment = HORIZONTAL_ALIGNMENT_LEFT) -> Label:
 	var l := Label.new()
+	l.text = text
 	l.add_theme_font_size_override("font_size", font_size)
-	l.add_theme_constant_override("outline_size", 8)
-	l.add_theme_color_override("font_outline_color", Color.BLACK)
+	l.add_theme_color_override("font_color", color)
+	l.add_theme_constant_override("outline_size", 4)
+	l.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.6))
 	l.horizontal_alignment = align
+	l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	return l
 
 
+func _make_bar(fill: Color) -> ProgressBar:
+	var b := ProgressBar.new()
+	b.show_percentage = false
+	b.min_value = 0.0
+	b.max_value = 100.0
+	b.custom_minimum_size = Vector2(0, 8)
+	var bg := StyleBoxFlat.new()
+	bg.bg_color = Color(1, 1, 1, 0.12)
+	bg.set_corner_radius_all(4)
+	var fg := StyleBoxFlat.new()
+	fg.bg_color = fill
+	fg.set_corner_radius_all(4)
+	b.add_theme_stylebox_override("background", bg)
+	b.add_theme_stylebox_override("fill", fg)
+	return b
+
+
+func _cell(c: Control, h_align: int) -> void:
+	c.size_flags_horizontal = (Control.SIZE_EXPAND | h_align) as Control.SizeFlags
+	c.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
+	c.mouse_filter = Control.MOUSE_FILTER_IGNORE
+
+
+func _keycap(text: String, width := 46.0) -> PanelContainer:
+	var p := PanelContainer.new()
+	p.add_theme_stylebox_override("panel", _style(Color(1, 1, 1, 0.10), Color(1, 1, 1, 0.38), 9, 2, 6))
+	p.custom_minimum_size = Vector2(width, 46)
+	p.add_child(_label(text, 20, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER))
+	return p
+
+
+func _stat_tile(parent: Control, caption: String) -> Label:
+	var p := PanelContainer.new()
+	p.add_theme_stylebox_override("panel", _style(Color(1, 1, 1, 0.05), Color(1, 1, 1, 0.10), 12, 1, 14))
+	p.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	parent.add_child(p)
+	var v := VBoxContainer.new()
+	v.add_theme_constant_override("separation", 0)
+	p.add_child(v)
+	v.add_child(_label(caption, 14, COL_MUTED))
+	var val := _label("0", 34, Color.WHITE)
+	v.add_child(val)
+	return val
+
+
+# ------------------------------------------------------------------------------
+# HUD
+# ------------------------------------------------------------------------------
 func _build_hud() -> void:
 	var hud := CanvasLayer.new()
-	hud.layer = 2
+	hud.layer = 3
 	add_child(hud)
+	var root := Control.new()
+	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hud.add_child(root)
+	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+
+	# ---- top bar: score | alcohol | speed --------------------------------------
+	var top := MarginContainer.new()
+	top.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	for m in ["margin_left", "margin_top", "margin_right", "margin_bottom"]:
+		top.add_theme_constant_override(m, 20)
+	root.add_child(top)
+	top.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	var bar := HBoxContainer.new()
+	bar.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	bar.add_theme_constant_override("separation", 12)
+	top.add_child(bar)
+
+	# score + route progress
+	var left := PanelContainer.new()
+	left.add_theme_stylebox_override("panel", _style(COL_PANEL, COL_BORDER, 14, 1, 14))
+	left.custom_minimum_size = Vector2(250, 0)
+	_cell(left, Control.SIZE_SHRINK_BEGIN)
+	bar.add_child(left)
+	var lv := VBoxContainer.new()
+	lv.add_theme_constant_override("separation", 4)
+	left.add_child(lv)
+	lv.add_child(_label("SCORE", 14, COL_MUTED))
+	score_label = _label("0", 44, Color.WHITE)
+	lv.add_child(score_label)
+	route_bar = _make_bar(COL_ACCENT)
+	lv.add_child(route_bar)
+	segment_label = _label("", 14, COL_MUTED)
+	lv.add_child(segment_label)
+
+	# alcohol meter
+	var mid := PanelContainer.new()
+	alc_panel_style = _style(COL_PANEL, COL_BORDER, 14, 2, 14)
+	mid.add_theme_stylebox_override("panel", alc_panel_style)
+	_cell(mid, Control.SIZE_SHRINK_CENTER)
+	bar.add_child(mid)
+	var mv := VBoxContainer.new()
+	mv.add_theme_constant_override("separation", 6)
+	mid.add_child(mv)
+	mv.add_child(_label("BLOOD ALCOHOL", 14, COL_MUTED, HORIZONTAL_ALIGNMENT_CENTER))
+	var cells := HBoxContainer.new()
+	cells.add_theme_constant_override("separation", 6)
+	cells.alignment = BoxContainer.ALIGNMENT_CENTER
+	mv.add_child(cells)
+	for i in range(3):
+		var cell := PanelContainer.new()
+		cell.custom_minimum_size = Vector2(64, 14)
+		var st := _style(Color(1, 1, 1, 0.12), Color(0, 0, 0, 0), 5, 0, 0)
+		cell.add_theme_stylebox_override("panel", st)
+		cells.add_child(cell)
+		alc_styles.append(st)
+	alc_state_label = _label("SOBER", 20, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER)
+	mv.add_child(alc_state_label)
+
+	# speedometer
+	var right := PanelContainer.new()
+	right.add_theme_stylebox_override("panel", _style(COL_PANEL, COL_BORDER, 14, 1, 14))
+	right.custom_minimum_size = Vector2(250, 0)
+	_cell(right, Control.SIZE_SHRINK_END)
+	bar.add_child(right)
+	var rv := VBoxContainer.new()
+	rv.add_theme_constant_override("separation", 4)
+	right.add_child(rv)
+	var sline := HBoxContainer.new()
+	sline.alignment = BoxContainer.ALIGNMENT_END
+	sline.add_theme_constant_override("separation", 8)
+	rv.add_child(sline)
+	speed_label = _label("0", 44, Color.WHITE, HORIZONTAL_ALIGNMENT_RIGHT)
+	sline.add_child(speed_label)
+	var unit := _label("KM/H", 16, COL_MUTED)
+	unit.vertical_alignment = VERTICAL_ALIGNMENT_BOTTOM
+	sline.add_child(unit)
+	speed_bar = _make_bar(COL_ACCENT)
+	rv.add_child(speed_bar)
+	speed_fill = speed_bar.get_theme_stylebox("fill") as StyleBoxFlat
+	var rcap := _label("SPEED", 14, COL_MUTED, HORIZONTAL_ALIGNMENT_RIGHT)
+	rv.add_child(rcap)
+
+	# ---- popup banner ----------------------------------------------------------
+	var pop_margin := MarginContainer.new()
+	pop_margin.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	pop_margin.add_theme_constant_override("margin_top", 140)
+	root.add_child(pop_margin)
+	pop_margin.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	var pop_box := VBoxContainer.new()
+	pop_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	pop_margin.add_child(pop_box)
+	popup_panel = PanelContainer.new()
+	popup_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	popup_panel.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	popup_style = _style(Color(0.04, 0.05, 0.09, 0.88), COL_ACCENT, 14, 2, 16)
+	popup_panel.add_theme_stylebox_override("panel", popup_style)
+	popup_panel.modulate.a = 0.0
+	pop_box.add_child(popup_panel)
+	popup_label = _label("", 30, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER)
+	popup_panel.add_child(popup_label)
+
+	# ---- control hint (fades out a few seconds after the start) -----------------
+	hint_label = _label("A / D  or  LEFT / RIGHT  -  change lane", 22, Color(1, 1, 1, 0.9), HORIZONTAL_ALIGNMENT_CENTER)
+	hint_label.modulate.a = 0.0
+	root.add_child(hint_label)
+	hint_label.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_WIDE, Control.PRESET_MODE_MINSIZE, 36)
+
+	_build_overlay(root)
+
+
+func _build_overlay(root: Control) -> void:
+	flash = ColorRect.new()
+	flash.color = Color(0.9, 0.05, 0.05, 0.0)
+	flash.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.add_child(flash)
+	flash.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 
 	dim = ColorRect.new()
-	dim.color = Color(0, 0, 0, 0.6)
+	dim.color = Color(0.02, 0.03, 0.06, 0.68)
 	dim.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud.add_child(dim)
+	root.add_child(dim)
 	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 
-	score_label = _make_label(28, HORIZONTAL_ALIGNMENT_LEFT)
-	hud.add_child(score_label)
-	score_label.set_anchors_and_offsets_preset(Control.PRESET_TOP_WIDE, Control.PRESET_MODE_MINSIZE, 20)
+	var center := CenterContainer.new()
+	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dim.add_child(center)
+	center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 
-	speed_label = _make_label(28, HORIZONTAL_ALIGNMENT_RIGHT)
-	hud.add_child(speed_label)
-	speed_label.set_anchors_and_offsets_preset(Control.PRESET_TOP_WIDE, Control.PRESET_MODE_MINSIZE, 20)
+	var card := PanelContainer.new()
+	card.add_theme_stylebox_override("panel", _style(Color(0.06, 0.07, 0.11, 0.95), Color(1, 1, 1, 0.14), 22, 2, 34))
+	card.custom_minimum_size = Vector2(700, 0)
+	card.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	center.add_child(card)
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 14)
+	card.add_child(box)
 
-	alcohol_label = _make_label(28, HORIZONTAL_ALIGNMENT_CENTER)
-	hud.add_child(alcohol_label)
-	alcohol_label.set_anchors_and_offsets_preset(Control.PRESET_TOP_WIDE, Control.PRESET_MODE_MINSIZE, 20)
+	title_label = _label("", 56, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER)
+	title_label.add_theme_constant_override("outline_size", 8)
+	box.add_child(title_label)
+	subtitle_label = _label("", 22, COL_MUTED, HORIZONTAL_ALIGNMENT_CENTER)
+	subtitle_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	box.add_child(subtitle_label)
+	box.add_child(HSeparator.new())
 
-	popup_label = _make_label(34, HORIZONTAL_ALIGNMENT_CENTER)
-	popup_label.modulate.a = 0.0
-	hud.add_child(popup_label)
-	popup_label.set_anchors_and_offsets_preset(Control.PRESET_TOP_WIDE, Control.PRESET_MODE_MINSIZE, 20)
-	popup_label.offset_top = 110.0
+	# ---- menu content ----------------------------------------------------------
+	menu_box = VBoxContainer.new()
+	menu_box.add_theme_constant_override("separation", 14)
+	box.add_child(menu_box)
 
-	center_label = _make_label(30, HORIZONTAL_ALIGNMENT_CENTER)
-	center_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	hud.add_child(center_label)
-	center_label.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	var keys := HBoxContainer.new()
+	keys.alignment = BoxContainer.ALIGNMENT_CENTER
+	keys.add_theme_constant_override("separation", 8)
+	menu_box.add_child(keys)
+	keys.add_child(_keycap("A"))
+	keys.add_child(_keycap("D"))
+	keys.add_child(_label("  or  ", 18, COL_MUTED))
+	keys.add_child(_keycap("LEFT", 84.0))
+	keys.add_child(_keycap("RIGHT", 96.0))
+	keys.add_child(_label("   change lane", 20, Color.WHITE))
+
+	for r in [["+1", "every second survived", Color(0.8, 0.85, 1.0)],
+			["+10", "close call with a hazard", Color(0.4, 1.0, 0.5)],
+			["+50", "route segment completed", Color(0.4, 0.8, 1.0)]]:
+		var line := HBoxContainer.new()
+		line.alignment = BoxContainer.ALIGNMENT_CENTER
+		line.add_theme_constant_override("separation", 14)
+		var chip := _label(r[0], 26, r[2], HORIZONTAL_ALIGNMENT_RIGHT)
+		chip.custom_minimum_size = Vector2(70, 0)
+		line.add_child(chip)
+		var desc := _label(r[1], 20, Color.WHITE)
+		desc.custom_minimum_size = Vector2(300, 0)
+		line.add_child(desc)
+		menu_box.add_child(line)
+
+	menu_box.add_child(_label(
+		"Crashing, hitting a pedestrian or leaving the road ends the run.\nThe farther you drive, the more you drink.",
+		18, Color(1, 0.7, 0.35), HORIZONTAL_ALIGNMENT_CENTER))
+
+	# ---- game over content -----------------------------------------------------
+	over_box = VBoxContainer.new()
+	over_box.add_theme_constant_override("separation", 14)
+	box.add_child(over_box)
+	var grid := GridContainer.new()
+	grid.columns = 2
+	grid.add_theme_constant_override("h_separation", 12)
+	grid.add_theme_constant_override("v_separation", 12)
+	over_box.add_child(grid)
+	stat_score = _stat_tile(grid, "SCORE")
+	stat_best = _stat_tile(grid, "BEST")
+	stat_dist = _stat_tile(grid, "DISTANCE")
+	stat_alc = _stat_tile(grid, "ALCOHOL LEVEL")
+	newbest_label = _label("NEW BEST SCORE!", 24, Color(1, 0.85, 0.3), HORIZONTAL_ALIGNMENT_CENTER)
+	over_box.add_child(newbest_label)
+	var msg := _label("Alcohol slows your reactions, narrows your vision and ruins your judgement.\nIt is never worth the risk. Don't drink and drive.",
+			18, COL_MUTED, HORIZONTAL_ALIGNMENT_CENTER)
+	msg.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	over_box.add_child(msg)
+	over_box.visible = false
+
+	# ---- prompt (pulsing) ------------------------------------------------------
+	box.add_child(HSeparator.new())
+	prompt_label = _label("", 24, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER)
+	box.add_child(prompt_label)
+	var pulse := create_tween().set_loops()
+	pulse.tween_property(prompt_label, "modulate:a", 0.35, 0.8)
+	pulse.tween_property(prompt_label, "modulate:a", 1.0, 0.8)
 
 
 func _update_hud() -> void:
-	score_label.text = "Score  %d\nSegment %d   %d / %d m" % [
-		score, segments_done + 1, int(-player.position.z) % int(SEGMENT_LENGTH), int(SEGMENT_LENGTH)]
-	speed_label.text = "%d km/h" % int(speed * 3.6)
-	alcohol_label.text = "ALCOHOL  [%s%s]" % ["#".repeat(level), "-".repeat(3 - level)]
-	alcohol_label.add_theme_color_override("font_color", LEVEL_COLORS[level])
+	var seg_pos := fposmod(-player.position.z, SEGMENT_LENGTH)
+	score_label.text = str(score)
+	segment_label.text = "SEGMENT %d  -  %d / %d m" % [segments_done + 1, int(seg_pos), int(SEGMENT_LENGTH)]
+	route_bar.value = seg_pos / SEGMENT_LENGTH * 100.0
+
+	speed_label.text = str(int(speed * 3.6))
+	var sr := clampf((speed - START_SPEED) / (MAX_SPEED - START_SPEED), 0.0, 1.0)
+	speed_bar.value = sr * 100.0
+	speed_fill.bg_color = COL_ACCENT.lerp(Color(1, 0.3, 0.25), sr)
+
+	# alcohol cells fill up smoothly while the level rises
+	for i in range(3):
+		var st: StyleBoxFlat = alc_styles[i]
+		st.bg_color = Color(1, 1, 1, 0.12).lerp(LEVEL_COLORS[i + 1], clampf(drunk - i, 0.0, 1.0))
+	if level != _hud_level:
+		_hud_level = level
+		alc_state_label.text = STATE_NAMES[level]
+		alc_state_label.add_theme_color_override("font_color", LEVEL_COLORS[level])
+		alc_panel_style.border_color = LEVEL_COLORS[level] if level > 0 else COL_BORDER
 
 
 func _popup(text: String, color: Color) -> void:
 	popup_label.text = text
-	popup_label.modulate = Color(color, 1.0)
+	popup_label.add_theme_color_override("font_color", color)
+	popup_style.border_color = color
+	popup_panel.reset_size()
 	if popup_tween:
 		popup_tween.kill()
+	popup_panel.modulate.a = 0.0
 	popup_tween = create_tween()
-	popup_tween.tween_interval(1.6)
-	popup_tween.tween_property(popup_label, "modulate:a", 0.0, 0.6)
+	popup_tween.tween_property(popup_panel, "modulate:a", 1.0, 0.12)
+	popup_tween.tween_interval(1.7)
+	popup_tween.tween_property(popup_panel, "modulate:a", 0.0, 0.5)
 
 
 func _build_post_fx() -> void:
+	# warm tint layer (below the blur so the blur affects it too)
+	var tint_layer := CanvasLayer.new()
+	tint_layer.layer = 1
+	add_child(tint_layer)
+	tint = ColorRect.new()
+	tint.color = Color(1.0, 0.75, 0.25, 0.0)
+	tint.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	tint_layer.add_child(tint)
+	tint.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+
 	var layer := CanvasLayer.new()
-	layer.layer = 1                       # below the HUD so text stays sharp
+	layer.layer = 2                       # below the HUD so text stays sharp
 	add_child(layer)
 	fx_rect = ColorRect.new()
 	fx_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -551,7 +972,7 @@ func _build_world() -> void:
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
 	env.fog_enabled = true
 	env.fog_light_color = Color(0.72, 0.8, 0.9)
-	env.fog_density = 0.008
+	env.fog_density = 0.006
 	var we := WorldEnvironment.new()
 	we.environment = env
 	add_child(we)
