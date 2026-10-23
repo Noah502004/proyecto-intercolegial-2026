@@ -2,16 +2,21 @@ extends Node3D
 ## ONE MORE DRINK - endless driving game about alcohol impairment (Godot 4.1+)
 ## Attach this script to a Node3D root, save the scene and press F5.
 ## Controls: A / Left = change lane left, D / Right = change lane right
-##           Enter / Space / R = start / restart      Esc = leave lobby
+##           Enter / Space / R = start / restart      Esc = back / leave
 ##
 ## MULTIPLAYER (ENet, 2-8 players, UDP port 24680)
-##   * One player presses HOST GAME, the others type the host's IP and press JOIN.
-##     Every instance must run THIS SAME script on a root node with the same name/path.
-##   * The host starts the race with Enter. Everybody drives through the SAME traffic
-##     (the world is a pure function of a shared random seed + time), other players are
-##     shown as translucent ghost cars. Last driver standing / highest score wins.
+##   * Main menu -> MULTIPLAYER.
+##   * HOST A NEW GAME: opens a lobby. The game is announced on your local network and the
+##     router port is opened automatically (UPnP) when possible.
+##   * JOIN: games on the same Wi-Fi / LAN show up in a list - just click one.
+##     Over the internet type the host's IP (the lobby shows it) and press JOIN.
+##   * Every instance must run THIS SAME script on a root node with the same name/path.
+##   * The host starts the race. Everybody drives through the SAME traffic (the world is a
+##     pure function of a shared random seed + time), other players are translucent ghost cars.
 ##   * Only position + score are sent over the network, collisions are checked locally.
-##   * To test on one PC: run two instances (Debug > Customize Run Instances) and join 127.0.0.1.
+##   * To test on one PC: run two instances (Debug > Customize Run Instances). Host in one,
+##     the other one lists the game automatically (or type 127.0.0.1).
+##   * Firewall: allow UDP 24680 (game) and UDP 24681 (LAN discovery).
 ##
 ## FAIRNESS: traffic is generated as "rows". Every row keeps one SAFE LANE free, the safe
 ## lane can only move by one lane between two rows, and rows are spaced by *time*
@@ -22,8 +27,12 @@ enum State { MENU, LOBBY, PLAYING, GAME_OVER }
 
 # --- Network ------------------------------------------------------------------
 const PORT := 24680
+const DISCOVERY_PORT := 24681      # UDP broadcast: hosts announce themselves here
+const GAME_ID := "one_more_drink_v1"
 const MAX_PLAYERS := 8
 const SEND_INTERVAL := 0.05
+const BEACON_INTERVAL := 1.0
+const CONNECT_TIMEOUT := 8.0       # seconds before a join attempt is given up
 const GHOST_COLORS := [Color(0.2, 0.5, 1.0), Color(0.2, 0.85, 0.4), Color(1.0, 0.8, 0.15),
 		Color(0.8, 0.3, 1.0), Color(1.0, 0.5, 0.1), Color(0.2, 0.9, 0.9), Color(1.0, 0.45, 0.7)]
 
@@ -75,6 +84,7 @@ const COL_PANEL := Color(0.04, 0.05, 0.09, 0.78)
 const COL_BORDER := Color(1, 1, 1, 0.14)
 const COL_MUTED := Color(0.66, 0.71, 0.8)
 const COL_ACCENT := Color(0.4, 0.8, 1.0)
+const COL_WARN := Color(1, 0.7, 0.35)
 
 const FX_SHADER := """
 shader_type canvas_item;
@@ -144,9 +154,30 @@ var safe_lane := 0             # lane that is guaranteed free in the last planne
 var online := false
 var is_host := false
 var my_name := "Player"
-var players := {}              # peer_id -> {name, score, alive, in_race, node, tx, tz, tyaw}
+var players := {}              # peer_id -> {name, joined, score, alive, in_race, node, tx, tz, tyaw}
 var net_timer := 0.0
 var ui_timer := 0.0
+var connecting := false
+var connect_start := 0         # ticks (ms) when the join attempt began
+var connect_target := ""
+var race_busy := false         # (client side) host says a race is running
+var last_busy := false         # (host side) last busy state that was broadcast
+var menu_page := 0             # 0 = main menu, 1 = multiplayer page
+
+# LAN discovery
+var beacon: PacketPeerUDP      # host: announces the game
+var beacon_timer := 0.0
+var beacon_targets: Array = []
+var listener: PacketPeerUDP    # menu: listens for announcements
+var listen_retry := 0.0
+var found := {}                # ip -> {name, players, port, busy, seen}
+var found_sig := ""
+
+# UPnP (automatic port forwarding for internet play)
+var upnp: UPNP
+var upnp_thread: Thread
+var upnp_state := 0            # 0 idle, 1 working, 2 ok, 3 failed
+var upnp_ip := ""
 
 # HUD
 var score_label: Label
@@ -168,6 +199,7 @@ var dim: ColorRect
 var title_label: Label
 var subtitle_label: Label
 var menu_box: VBoxContainer
+var mp_box: VBoxContainer
 var lobby_box: VBoxContainer
 var over_box: VBoxContainer
 var prompt_label: Label
@@ -177,13 +209,19 @@ var stat_best: Label
 var stat_dist: Label
 var stat_alc: Label
 var standings_label: Label
+var lobby_head: Label
 var lobby_list: Label
+var lobby_info: Label
 var board_panel: PanelContainer
 var board_label: Label
 var name_edit: LineEdit
 var addr_edit: LineEdit
 var host_btn: Button
 var join_btn: Button
+var act_a: Button
+var act_b: Button
+var games_box: VBoxContainer
+var games_label: Label
 var net_status: Label
 var tint: ColorRect
 var fx_rect: ColorRect
@@ -214,6 +252,15 @@ func _ready() -> void:
 	_show_menu()
 
 
+func _exit_tree() -> void:
+	_stop_beacon()
+	_stop_listening()
+	if upnp_thread != null:
+		upnp_thread.wait_to_finish()
+		upnp_thread = null
+	_upnp_close()
+
+
 # ------------------------------------------------------------------------------
 # Input
 # ------------------------------------------------------------------------------
@@ -240,105 +287,252 @@ func _unhandled_input(event: InputEvent) -> void:
 		get_viewport().gui_release_focus()
 	match state:
 		State.MENU:
-			if event.is_action_pressed("start"):
-				_reset_run(randi())
-				_start()
+			if event.is_action_pressed("back"):
+				if connecting:
+					_cancel_connect("Cancelled.")
+				elif menu_page == 1:
+					_show_menu()
+			elif event.is_action_pressed("start") and menu_page == 0 and not connecting:
+				_solo()
 		State.LOBBY:
 			if event.is_action_pressed("back"):
 				_leave_online()
-			elif event.is_action_pressed("start") and is_host:
-				rpc("_rpc_start", randi())
+			elif event.is_action_pressed("start"):
+				_host_start()
 		State.PLAYING:
 			if event.is_action_pressed("steer_left"):
 				_queue_steer(-1)
 			elif event.is_action_pressed("steer_right"):
 				_queue_steer(1)
 		State.GAME_OVER:
-			if online and event.is_action_pressed("back"):
+			if event.is_action_pressed("back"):
+				if online:
+					_leave_online()
+				else:
+					_to_main_menu()
+			elif event.is_action_pressed("start"):
+				_restart_pressed()
+
+
+# Shared actions (keyboard AND buttons use the same code paths)
+func _solo() -> void:
+	_reset_run(randi())
+	_start()
+
+
+func _host_start() -> void:
+	if online and is_host:
+		rpc("_rpc_start", randi())
+
+
+func _restart_pressed() -> void:
+	# short lockout so mashing A/D at the moment of the crash can't restart
+	if Time.get_ticks_msec() / 1000.0 - over_time <= 0.8:
+		return
+	if not online:
+		_solo()
+	elif is_host and _all_dead():
+		_host_start()
+
+
+func _to_main_menu() -> void:
+	_reset_run(randi())
+	_show_menu()
+
+
+func _on_act_a() -> void:
+	match state:
+		State.MENU:
+			if menu_page == 0 and not connecting:
+				_solo()
+		State.LOBBY:
+			_host_start()
+		State.GAME_OVER:
+			_restart_pressed()
+
+
+func _on_act_b() -> void:
+	match state:
+		State.MENU:
+			if connecting:
+				_cancel_connect("Cancelled.")
+			elif menu_page == 1:
+				_show_menu()
+			else:
+				_show_mp_page()
+		State.LOBBY:
+			_leave_online()
+		State.GAME_OVER:
+			if online:
 				_leave_online()
-				return
-			# short lockout so mashing A/D at the moment of the crash can't restart
-			if event.is_action_pressed("start") and Time.get_ticks_msec() / 1000.0 - over_time > 0.8:
-				if not online:
-					_reset_run(randi())
-					_start()
-				elif is_host and _all_dead():
-					rpc("_rpc_start", randi())
+			else:
+				_to_main_menu()
+
+
+# The two big buttons at the bottom of the menu card change with the situation.
+func _refresh_actions() -> void:
+	act_a.visible = false
+	act_a.disabled = false
+	act_b.visible = true
+	match state:
+		State.MENU:
+			if connecting:
+				act_b.text = "CANCEL"
+			elif menu_page == 0:
+				act_a.visible = true
+				act_a.text = "PLAY SOLO"
+				act_b.text = "MULTIPLAYER"
+			else:
+				act_b.text = "BACK"
+		State.LOBBY:
+			act_a.visible = is_host
+			act_a.text = "START RACE"
+			act_b.text = "LEAVE LOBBY"
+		State.GAME_OVER:
+			act_a.visible = (not online) or is_host
+			act_a.text = "PLAY AGAIN" if online else "TRY AGAIN"
+			act_a.disabled = online and not _all_dead()
+			act_b.text = "LEAVE GAME" if online else "MAIN MENU"
+		_:
+			act_b.visible = false
 
 
 # ------------------------------------------------------------------------------
-# Networking
+# Networking: hosting / joining
 # ------------------------------------------------------------------------------
 func _set_my_name() -> void:
 	my_name = name_edit.text.strip_edges()
 	if my_name.is_empty():
 		my_name = "Player%d" % (randi() % 900 + 100)
+		name_edit.text = my_name
 
 
 func _on_host_pressed() -> void:
+	if connecting or online:
+		return
 	_set_my_name()
 	var peer := ENetMultiplayerPeer.new()
 	if peer.create_server(PORT, MAX_PLAYERS - 1) != OK:
-		net_status.text = "Could not host (is port %d already in use?)" % PORT
+		net_status.text = "Could not host - is UDP port %d already in use (another copy of the game)?" % PORT
 		return
 	multiplayer.multiplayer_peer = peer
 	_clear_players()
 	online = true
 	is_host = true
+	race_busy = false
+	last_busy = false
+	_stop_listening()
+	_start_beacon()
+	_upnp_start()
 	_enter_lobby()
 
 
-func _on_join_pressed() -> void:
+# JOIN button / Enter in the address field
+func _join_from_field() -> void:
+	var raw := addr_edit.text.strip_edges()
+	if raw.is_empty():
+		net_status.text = "Pick a game from the list, or type the host's IP address first."
+		return
+	var host := raw
+	var port := PORT
+	if raw.count(":") == 1:                      # "192.168.1.20:24680"
+		var parts := raw.split(":")
+		host = parts[0].strip_edges()
+		if parts[1].strip_edges().is_valid_int():
+			port = int(parts[1])
+	if host.is_empty() or port < 1 or port > 65535:
+		net_status.text = "That address doesn't look right. Example: 192.168.1.20"
+		return
+	_join(host, port)
+
+
+func _join(host: String, port: int) -> void:
+	if connecting or online:
+		return
 	_set_my_name()
-	var addr := addr_edit.text.strip_edges()
-	if addr.is_empty():
-		addr = "127.0.0.1"
 	var peer := ENetMultiplayerPeer.new()
-	if peer.create_client(addr, PORT) != OK:
-		net_status.text = "Invalid address."
+	if peer.create_client(host, port) != OK:
+		net_status.text = "That address doesn't look right: %s" % host
 		return
 	multiplayer.multiplayer_peer = peer
-	net_status.text = "Connecting to %s ..." % addr
-	host_btn.disabled = true
-	join_btn.disabled = true
+	connecting = true
+	connect_start = Time.get_ticks_msec()
+	connect_target = "%s:%d" % [host, port]
+	addr_edit.text = host if port == PORT else connect_target
+	net_status.add_theme_color_override("font_color", COL_ACCENT)
+	net_status.text = "Connecting to %s" % connect_target
+	_set_menu_busy(true)
+	_refresh_actions()
+
+
+func _cancel_connect(msg: String) -> void:
+	if not connecting:
+		return
+	connecting = false
+	if multiplayer.multiplayer_peer != null:
+		multiplayer.multiplayer_peer.close()
+	multiplayer.multiplayer_peer = OfflineMultiplayerPeer.new()
+	_set_menu_busy(false)
+	net_status.add_theme_color_override("font_color", COL_WARN)
+	net_status.text = msg
+	_refresh_actions()
+
+
+func _fail_text() -> String:
+	return "Could not reach %s.\nCheck the IP, make sure the host is in the lobby, and that UDP port %d is allowed through the firewall." % [connect_target, PORT]
+
+
+func _set_menu_busy(busy: bool) -> void:
+	host_btn.disabled = busy
+	join_btn.disabled = busy
+	name_edit.editable = not busy
+	addr_edit.editable = not busy
+	for c in games_box.get_children():
+		if c is Button:
+			c.disabled = busy
 
 
 func _on_connected_to_server() -> void:
+	connecting = false
 	online = true
 	is_host = false
+	race_busy = false
+	_clear_players()
+	_set_menu_busy(false)
+	rpc_id(1, "_rpc_hello", my_name)     # the host answers with the player roster
 	_enter_lobby()
 
 
 func _on_connection_failed() -> void:
-	multiplayer.multiplayer_peer = OfflineMultiplayerPeer.new()
-	host_btn.disabled = false
-	join_btn.disabled = false
-	net_status.text = "Connection failed."
+	_cancel_connect(_fail_text())
 
 
 func _on_server_disconnected() -> void:
 	_leave_online("The host left the game.")
 
 
+# Only the host tracks raw connections; clients learn about everybody from the roster.
 func _on_peer_connected(id: int) -> void:
-	_ensure_player(id)
-	rpc_id(id, "_rpc_hello", my_name)   # tell the newcomer (or the host) who we are
-	_refresh_lobby()
+	if is_host:
+		_ensure_player(id)
 
 
 func _on_peer_disconnected(id: int) -> void:
 	if players.has(id):
 		_free_ghost(players[id])
 		players.erase(id)
+	if is_host:
+		_broadcast_roster()
 	_refresh_lobby()
 	if state == State.GAME_OVER:
 		_refresh_over_online()
+		_refresh_actions()
 
 
 func _ensure_player(id: int) -> void:
 	if players.has(id):
 		return
-	players[id] = {"name": "Player", "score": 0, "alive": false, "in_race": false,
+	players[id] = {"name": "Player", "joined": false, "score": 0, "alive": false, "in_race": false,
 			"node": null, "tx": 0.0, "tz": 0.0, "tyaw": 0.0}
 
 
@@ -358,19 +552,58 @@ func _leave_online(msg := "") -> void:
 	if multiplayer.multiplayer_peer != null:
 		multiplayer.multiplayer_peer.close()
 	multiplayer.multiplayer_peer = OfflineMultiplayerPeer.new()
+	_stop_beacon()
+	_upnp_close()
 	online = false
 	is_host = false
+	connecting = false
 	_clear_players()
 	_reset_run(randi())
 	_show_menu(msg)
 
 
+# Client -> host: "I am here, my name is ..."
 @rpc("any_peer", "call_remote", "reliable")
 func _rpc_hello(pname: String) -> void:
+	if not is_host:
+		return
 	var id := multiplayer.get_remote_sender_id()
 	_ensure_player(id)
-	players[id]["name"] = pname.substr(0, 12)
+	var n := pname.strip_edges().substr(0, 12)
+	players[id]["name"] = n if n != "" else "Player"
+	players[id]["joined"] = true
+	_broadcast_roster()
 	_refresh_lobby()
+
+
+# Host -> everybody: the authoritative list of players (names) + whether a race is running.
+func _broadcast_roster() -> void:
+	if not is_host:
+		return
+	var names := {1: my_name}
+	for id in players:
+		if players[id]["joined"]:
+			names[id] = players[id]["name"]
+	rpc("_rpc_roster", names, _race_busy())
+
+
+@rpc("authority", "call_remote", "reliable")
+func _rpc_roster(names: Dictionary, busy: bool) -> void:
+	race_busy = busy
+	var my_id := multiplayer.get_unique_id()
+	for id in names:
+		if id == my_id:
+			continue
+		_ensure_player(id)
+		players[id]["name"] = str(names[id])
+		players[id]["joined"] = true
+	for id in players.keys():
+		if not names.has(id):
+			_free_ghost(players[id])
+			players.erase(id)
+	_refresh_lobby()
+	if state == State.GAME_OVER:
+		_refresh_over_online()
 
 
 # Only the host (authority) may start a race. call_local: the host starts too.
@@ -418,20 +651,40 @@ func _all_dead() -> bool:
 	return true
 
 
+# Host only: is a race running right now? (late joiners wait in the lobby for the next one)
+func _race_busy() -> bool:
+	if state == State.PLAYING:
+		return true
+	if state == State.GAME_OVER:
+		return not _all_dead()
+	return false
+
+
+func _check_busy() -> void:
+	var b := _race_busy()
+	if b != last_busy:
+		last_busy = b
+		_broadcast_roster()
+
+
 # Ghost cars of the other players
 func _spawn_ghosts() -> void:
 	var ids := players.keys()
 	ids.sort()
-	for i in range(ids.size()):
-		var p: Dictionary = players[ids[i]]
+	for id in ids:
+		var p: Dictionary = players[id]
 		_free_ghost(p)
+		p["in_race"] = false
+		p["alive"] = false
+		if not p["joined"]:
+			continue
 		p["in_race"] = true
 		p["alive"] = true
 		p["score"] = 0
 		p["tx"] = 0.0
 		p["tz"] = 0.0
 		p["tyaw"] = 0.0
-		var n := _make_car_model(GHOST_COLORS[i % GHOST_COLORS.size()])
+		var n := _make_car_model(GHOST_COLORS[int(id) % GHOST_COLORS.size()])
 		_ghostify(n)
 		var lbl := Label3D.new()
 		lbl.text = p["name"]
@@ -506,42 +759,252 @@ func _refresh_over_online() -> void:
 		prompt_label.text = "WAITING FOR OTHER DRIVERS..."
 
 
-func _local_ips() -> String:
-	var out := ""
-	var count := 0
+# ------------------------------------------------------------------------------
+# LAN discovery: the host broadcasts a small UDP packet once per second, the menu
+# listens for it and shows the games as clickable buttons.
+# ------------------------------------------------------------------------------
+func _is_private(a: String) -> bool:
+	if a.begins_with("192.168.") or a.begins_with("10."):
+		return true
+	if a.begins_with("172."):
+		var second := int(a.split(".")[1])
+		return second >= 16 and second <= 31
+	return false
+
+
+func _lan_ips() -> Array:
+	var out: Array = []
 	for a in IP.get_local_addresses():
-		if a.count(".") == 3 and not a.begins_with("127.") and not a.begins_with("169.254."):
-			out += ("" if count == 0 else ", ") + a
-			count += 1
-			if count >= 3:
-				break
+		if a.count(".") == 3 and not a.begins_with("127.") and not a.begins_with("169.254.") and _is_private(a):
+			out.append(a)
 	return out
 
 
+func _local_ips() -> String:
+	var out := ""
+	var count := 0
+	for a in _lan_ips():
+		out += ("" if count == 0 else ", ") + a
+		count += 1
+		if count >= 3:
+			break
+	return out
+
+
+func _start_beacon() -> void:
+	_stop_beacon()
+	beacon = PacketPeerUDP.new()
+	beacon.set_broadcast_enabled(true)
+	beacon_timer = 0.0
+	beacon_targets = ["255.255.255.255", "127.0.0.1"]
+	for a in _lan_ips():
+		var parts := String(a).split(".")
+		var t := "%s.%s.%s.255" % [parts[0], parts[1], parts[2]]
+		if not beacon_targets.has(t):
+			beacon_targets.append(t)
+
+
+func _stop_beacon() -> void:
+	if beacon != null:
+		beacon.close()
+		beacon = null
+
+
+func _send_beacon() -> void:
+	var joined := 1
+	for id in players:
+		if players[id]["joined"]:
+			joined += 1
+	var data := JSON.stringify({"g": GAME_ID, "name": my_name, "players": joined,
+			"port": PORT, "busy": _race_busy()}).to_utf8_buffer()
+	for dest in beacon_targets:
+		beacon.set_dest_address(dest, DISCOVERY_PORT)
+		beacon.put_packet(data)
+
+
+func _start_listening() -> void:
+	if listener != null:
+		return
+	var l := PacketPeerUDP.new()
+	if l.bind(DISCOVERY_PORT) != OK:
+		return          # port busy (e.g. 2nd copy on this PC) - typing the IP still works
+	listener = l
+
+
+func _stop_listening() -> void:
+	if listener != null:
+		listener.close()
+		listener = null
+	found.clear()
+	found_sig = ""
+	if games_box != null:
+		for c in games_box.get_children():
+			games_box.remove_child(c)
+			c.queue_free()
+		games_label.visible = true
+
+
+func _poll_discovery(delta: float) -> void:
+	if listener == null:
+		listen_retry -= delta
+		if listen_retry <= 0.0:
+			listen_retry = 1.0
+			_start_listening()
+		return
+	var now := Time.get_ticks_msec() / 1000.0
+	while listener.get_available_packet_count() > 0:
+		var text := listener.get_packet().get_string_from_utf8()
+		var ip := listener.get_packet_ip()
+		var d = JSON.parse_string(text)
+		if typeof(d) != TYPE_DICTIONARY or str(d.get("g", "")) != GAME_ID:
+			continue
+		found[ip] = {"name": str(d.get("name", "?")).substr(0, 12), "players": int(d.get("players", 1)),
+				"port": int(d.get("port", PORT)), "busy": bool(d.get("busy", false)), "seen": now}
+	for ip in found.keys():
+		if now - float(found[ip]["seen"]) > 4.0:
+			found.erase(ip)
+	_refresh_games_list()
+
+
+func _refresh_games_list() -> void:
+	var ips := found.keys()
+	ips.sort()
+	var sig := ""
+	for ip in ips:
+		var g: Dictionary = found[ip]
+		sig += "%s|%s|%d|%s;" % [ip, g["name"], g["players"], str(g["busy"])]
+	if sig == found_sig:
+		return
+	found_sig = sig
+	for c in games_box.get_children():
+		games_box.remove_child(c)
+		c.queue_free()
+	games_label.visible = ips.is_empty()
+	for ip in ips:
+		var g: Dictionary = found[ip]
+		var txt := "%s's game   -   %d / %d players%s" % [g["name"], g["players"], MAX_PLAYERS,
+				"   (race running)" if g["busy"] else ""]
+		var b := _button(txt, _join.bind(str(ip), int(g["port"])))
+		b.custom_minimum_size = Vector2(0, 46)
+		b.disabled = connecting
+		games_box.add_child(b)
+
+
+# ------------------------------------------------------------------------------
+# UPnP: asks the router to forward the game port so friends on the internet can join.
+# Runs in a thread because discovery can block for a second or two.
+# ------------------------------------------------------------------------------
+func _upnp_start() -> void:
+	if upnp_state == 1:
+		return
+	if upnp_thread != null:
+		upnp_thread.wait_to_finish()
+	upnp_state = 1
+	upnp_ip = ""
+	upnp_thread = Thread.new()
+	upnp_thread.start(_upnp_worker)
+
+
+func _upnp_worker() -> void:
+	var u := UPNP.new()
+	var ok := false
+	var ip := ""
+	if u.discover(1500, 2) == UPNP.UPNP_RESULT_SUCCESS:
+		var gw := u.get_gateway()
+		if gw != null and gw.is_valid_gateway():
+			if u.add_port_mapping(PORT, PORT, "One More Drink", "UDP") == UPNP.UPNP_RESULT_SUCCESS:
+				ok = true
+				ip = u.query_external_address()
+				upnp = u
+	_upnp_done.call_deferred(ok, ip)
+
+
+func _upnp_done(ok: bool, ip: String) -> void:
+	if upnp_thread != null:
+		upnp_thread.wait_to_finish()
+		upnp_thread = null
+	upnp_state = 2 if ok else 3
+	upnp_ip = ip
+	if not (online and is_host):
+		_upnp_close()           # we stopped hosting while it was working
+	elif state == State.LOBBY:
+		_refresh_lobby_info()
+
+
+func _upnp_close() -> void:
+	if upnp != null:
+		upnp.delete_port_mapping(PORT, "UDP")
+		upnp = null
+
+
+func _host_info_text() -> String:
+	var t := "Hosting on UDP port %d." % PORT
+	var ips := _local_ips()
+	if ips != "":
+		t += "\nSame Wi-Fi / network: friends see your game in the JOIN list automatically (or type %s)." % ips
+	else:
+		t += "\nSame Wi-Fi / network: friends see your game in the JOIN list automatically."
+	match upnp_state:
+		1:
+			t += "\nInternet: opening the port on your router..."
+		2:
+			if upnp_ip != "":
+				t += "\nInternet: friends can join by typing  %s" % upnp_ip
+			else:
+				t += "\nInternet: port opened on your router."
+		3:
+			t += "\nInternet: the router could not be set up automatically. Forward UDP port %d to this PC, or play through a VPN such as Tailscale or ZeroTier." % PORT
+	return t
+
+
+func _refresh_lobby_info() -> void:
+	lobby_info.visible = is_host
+	lobby_info.text = _host_info_text() if is_host else ""
+
+
+# ------------------------------------------------------------------------------
+# Menu / lobby screens
+# ------------------------------------------------------------------------------
 func _enter_lobby() -> void:
 	state = State.LOBBY
+	connecting = false
 	dim.visible = true
 	menu_box.visible = false
+	mp_box.visible = false
 	over_box.visible = false
 	lobby_box.visible = true
 	board_panel.visible = false
+	_stop_listening()
 	title_label.text = "LOBBY"
 	title_label.add_theme_color_override("font_color", COL_ACCENT)
 	if is_host:
-		subtitle_label.text = "Hosting on UDP port %d.\nFriends join with: %s" % [PORT, _local_ips()]
+		subtitle_label.text = "You are the host. Start the race when everybody has joined."
 	else:
-		subtitle_label.text = "Connected to the host."
+		subtitle_label.text = "Connected! The host will start the race."
 	_refresh_lobby()
+	_refresh_lobby_info()
+	_refresh_actions()
 
 
 func _refresh_lobby() -> void:
 	if state != State.LOBBY:
 		return
+	var count := 1
 	var t := "%s  (you)%s" % [my_name, "  - host" if is_host else ""]
-	for id in players:
-		t += "\n%s%s" % [players[id]["name"], "  - host" if id == 1 else ""]
+	var ids := players.keys()
+	ids.sort()
+	for id in ids:
+		if players[id]["joined"]:
+			count += 1
+			t += "\n%s%s" % [players[id]["name"], "  - host" if id == 1 else ""]
+	lobby_head.text = "PLAYERS  (%d / %d)" % [count, MAX_PLAYERS]
 	lobby_list.text = t
-	prompt_label.text = "PRESS  ENTER  TO START THE RACE" if is_host else "WAITING FOR THE HOST..."
+	if is_host:
+		prompt_label.text = "PRESS  ENTER  TO START THE RACE"
+	elif race_busy:
+		prompt_label.text = "A RACE IS RUNNING - YOU JOIN THE NEXT ONE"
+	else:
+		prompt_label.text = "WAITING FOR THE HOST..."
 
 
 # ------------------------------------------------------------------------------
@@ -549,18 +1012,41 @@ func _refresh_lobby() -> void:
 # ------------------------------------------------------------------------------
 func _show_menu(msg := "") -> void:
 	state = State.MENU
+	menu_page = 0
 	dim.visible = true
 	menu_box.visible = true
+	mp_box.visible = false
 	lobby_box.visible = false
 	over_box.visible = false
 	board_panel.visible = false
-	host_btn.disabled = false
-	join_btn.disabled = false
+	_stop_listening()
+	_set_menu_busy(connecting)
 	net_status.text = ""
 	title_label.text = "ONE MORE DRINK"
 	title_label.add_theme_color_override("font_color", Color(1.0, 0.82, 0.35))
 	subtitle_label.text = msg if msg != "" else "An endless road. A dangerous choice."
 	prompt_label.text = "PRESS  ENTER  FOR  SOLO  PLAY"
+	_refresh_actions()
+
+
+func _show_mp_page() -> void:
+	state = State.MENU
+	menu_page = 1
+	dim.visible = true
+	menu_box.visible = false
+	mp_box.visible = true
+	lobby_box.visible = false
+	over_box.visible = false
+	board_panel.visible = false
+	title_label.text = "MULTIPLAYER"
+	title_label.add_theme_color_override("font_color", COL_ACCENT)
+	subtitle_label.text = "Everyone drives the same traffic. Last driver standing wins."
+	prompt_label.text = "PICK A GAME, OR ENTER THE HOST'S IP"
+	net_status.add_theme_color_override("font_color", COL_WARN)
+	net_status.text = ""
+	listen_retry = 0.0
+	_start_listening()
+	_refresh_actions()
 
 
 func _reset_run(seed_value: int) -> void:
@@ -607,6 +1093,7 @@ func _start() -> void:
 	var ht := create_tween()
 	ht.tween_interval(5.0)
 	ht.tween_property(hint_label, "modulate:a", 0.0, 1.0)
+	_refresh_actions()
 
 
 func _game_over(reason: String) -> void:
@@ -620,6 +1107,7 @@ func _game_over(reason: String) -> void:
 
 	dim.visible = true
 	menu_box.visible = false
+	mp_box.visible = false
 	lobby_box.visible = false
 	over_box.visible = true
 	board_panel.visible = false
@@ -637,14 +1125,30 @@ func _game_over(reason: String) -> void:
 		_refresh_over_online()
 	else:
 		prompt_label.text = "PRESS  ENTER  TO TRY AGAIN"
+	_refresh_actions()
 
 
 func _process(delta: float) -> void:
 	delta = minf(delta, 0.05)
 	if state == State.PLAYING:
 		_update_game(delta)
+
+	if connecting:
+		var elapsed := (Time.get_ticks_msec() - connect_start) / 1000.0
+		net_status.text = "Connecting to %s%s" % [connect_target, ".".repeat(int(elapsed * 2.0) % 4)]
+		if elapsed > CONNECT_TIMEOUT:
+			_cancel_connect(_fail_text())
+
+	if state == State.MENU and menu_page == 1 and not connecting:
+		_poll_discovery(delta)
+
 	if online:
 		_update_remotes(delta)
+		if is_host and beacon != null:
+			beacon_timer -= delta
+			if beacon_timer <= 0.0:
+				beacon_timer = BEACON_INTERVAL
+				_send_beacon()
 		ui_timer -= delta
 		if ui_timer <= 0.0:
 			ui_timer = 0.2
@@ -652,6 +1156,9 @@ func _process(delta: float) -> void:
 				_refresh_board()
 			elif state == State.GAME_OVER:
 				_refresh_over_online()
+				_refresh_actions()
+			if is_host:
+				_check_busy()
 	_update_camera(delta)
 
 
@@ -1241,12 +1748,12 @@ func _build_overlay(root: Control) -> void:
 	center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 
 	var card := PanelContainer.new()
-	card.add_theme_stylebox_override("panel", _style(Color(0.06, 0.07, 0.11, 0.95), Color(1, 1, 1, 0.14), 22, 2, 34))
+	card.add_theme_stylebox_override("panel", _style(Color(0.06, 0.07, 0.11, 0.95), Color(1, 1, 1, 0.14), 22, 2, 30))
 	card.custom_minimum_size = Vector2(700, 0)
 	card.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	center.add_child(card)
 	var box := VBoxContainer.new()
-	box.add_theme_constant_override("separation", 14)
+	box.add_theme_constant_override("separation", 12)
 	card.add_child(box)
 
 	title_label = _label("", 56, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER)
@@ -1257,7 +1764,7 @@ func _build_overlay(root: Control) -> void:
 	box.add_child(subtitle_label)
 	box.add_child(HSeparator.new())
 
-	# ---- menu content ----------------------------------------------------------
+	# ---- main menu content -----------------------------------------------------
 	menu_box = VBoxContainer.new()
 	menu_box.add_theme_constant_override("separation", 14)
 	box.add_child(menu_box)
@@ -1289,48 +1796,70 @@ func _build_overlay(root: Control) -> void:
 
 	menu_box.add_child(_label(
 		"Crashing, hitting a pedestrian or leaving the road ends the run.\nThe farther you drive, the more you drink.",
-		18, Color(1, 0.7, 0.35), HORIZONTAL_ALIGNMENT_CENTER))
+		18, COL_WARN, HORIZONTAL_ALIGNMENT_CENTER))
 
-	# multiplayer section
-	menu_box.add_child(HSeparator.new())
-	menu_box.add_child(_label("MULTIPLAYER  -  same traffic for everyone, last driver standing wins",
-			16, COL_ACCENT, HORIZONTAL_ALIGNMENT_CENTER))
-	var fields := HBoxContainer.new()
-	fields.alignment = BoxContainer.ALIGNMENT_CENTER
-	fields.add_theme_constant_override("separation", 10)
-	menu_box.add_child(fields)
+	# ---- multiplayer page ------------------------------------------------------
+	mp_box = VBoxContainer.new()
+	mp_box.add_theme_constant_override("separation", 12)
+	box.add_child(mp_box)
+	mp_box.visible = false
+
+	var name_row := HBoxContainer.new()
+	name_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	name_row.add_theme_constant_override("separation", 10)
+	mp_box.add_child(name_row)
+	name_row.add_child(_label("Your name", 18, COL_MUTED))
 	name_edit = LineEdit.new()
 	name_edit.text = "Player%d" % (randi() % 900 + 100)
 	name_edit.placeholder_text = "Your name"
 	name_edit.max_length = 12
-	name_edit.custom_minimum_size = Vector2(170, 40)
+	name_edit.custom_minimum_size = Vector2(220, 40)
 	name_edit.text_submitted.connect(func(_t): name_edit.release_focus())
-	fields.add_child(name_edit)
+	name_row.add_child(name_edit)
+
+	host_btn = _button("HOST A NEW GAME", _on_host_pressed)
+	host_btn.custom_minimum_size = Vector2(320, 50)
+	host_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	mp_box.add_child(host_btn)
+
+	mp_box.add_child(_label("-   or join a game   -", 18, COL_MUTED, HORIZONTAL_ALIGNMENT_CENTER))
+	games_label = _label("Searching for games on your network...", 18, COL_MUTED, HORIZONTAL_ALIGNMENT_CENTER)
+	mp_box.add_child(games_label)
+	games_box = VBoxContainer.new()
+	games_box.add_theme_constant_override("separation", 6)
+	mp_box.add_child(games_box)
+
+	var ip_row := HBoxContainer.new()
+	ip_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	ip_row.add_theme_constant_override("separation", 10)
+	mp_box.add_child(ip_row)
+	ip_row.add_child(_label("Host IP", 18, COL_MUTED))
 	addr_edit = LineEdit.new()
-	addr_edit.text = "127.0.0.1"
-	addr_edit.placeholder_text = "Host IP"
-	addr_edit.custom_minimum_size = Vector2(200, 40)
-	addr_edit.text_submitted.connect(func(_t): addr_edit.release_focus(); _on_join_pressed())
-	fields.add_child(addr_edit)
-	var btns := HBoxContainer.new()
-	btns.alignment = BoxContainer.ALIGNMENT_CENTER
-	btns.add_theme_constant_override("separation", 10)
-	menu_box.add_child(btns)
-	host_btn = _button("HOST GAME", _on_host_pressed)
-	btns.add_child(host_btn)
-	join_btn = _button("JOIN", _on_join_pressed)
-	btns.add_child(join_btn)
-	net_status = _label("", 18, Color(1, 0.7, 0.35), HORIZONTAL_ALIGNMENT_CENTER)
-	menu_box.add_child(net_status)
+	addr_edit.placeholder_text = "e.g. 192.168.1.20"
+	addr_edit.custom_minimum_size = Vector2(240, 40)
+	addr_edit.text_submitted.connect(func(_t): addr_edit.release_focus(); _join_from_field())
+	ip_row.add_child(addr_edit)
+	join_btn = _button("JOIN", _join_from_field)
+	join_btn.custom_minimum_size = Vector2(110, 40)
+	ip_row.add_child(join_btn)
+
+	net_status = _label("", 18, COL_WARN, HORIZONTAL_ALIGNMENT_CENTER)
+	net_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	net_status.custom_minimum_size = Vector2(640, 0)
+	mp_box.add_child(net_status)
 
 	# ---- lobby content ---------------------------------------------------------
 	lobby_box = VBoxContainer.new()
 	lobby_box.add_theme_constant_override("separation", 10)
 	box.add_child(lobby_box)
-	lobby_box.add_child(_label("PLAYERS", 14, COL_MUTED, HORIZONTAL_ALIGNMENT_CENTER))
-	lobby_list = _label("", 26, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER)
+	lobby_head = _label("PLAYERS", 14, COL_MUTED, HORIZONTAL_ALIGNMENT_CENTER)
+	lobby_box.add_child(lobby_head)
+	lobby_list = _label("", 22, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER)
 	lobby_box.add_child(lobby_list)
-	lobby_box.add_child(_label("ESC  -  leave lobby", 16, COL_MUTED, HORIZONTAL_ALIGNMENT_CENTER))
+	lobby_info = _label("", 16, COL_MUTED, HORIZONTAL_ALIGNMENT_CENTER)
+	lobby_info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	lobby_info.custom_minimum_size = Vector2(640, 0)
+	lobby_box.add_child(lobby_info)
 	lobby_box.visible = false
 
 	# ---- game over content -----------------------------------------------------
@@ -1357,13 +1886,24 @@ func _build_overlay(root: Control) -> void:
 	over_box.add_child(msg)
 	over_box.visible = false
 
-	# ---- prompt (pulsing) ------------------------------------------------------
+	# ---- prompt (pulsing) + action buttons --------------------------------------
 	box.add_child(HSeparator.new())
 	prompt_label = _label("", 24, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER)
 	box.add_child(prompt_label)
 	var pulse := create_tween().set_loops()
 	pulse.tween_property(prompt_label, "modulate:a", 0.35, 0.8)
 	pulse.tween_property(prompt_label, "modulate:a", 1.0, 0.8)
+
+	var act_row := HBoxContainer.new()
+	act_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	act_row.add_theme_constant_override("separation", 14)
+	box.add_child(act_row)
+	act_a = _button("", _on_act_a)
+	act_a.custom_minimum_size = Vector2(220, 50)
+	act_row.add_child(act_a)
+	act_b = _button("", _on_act_b)
+	act_b.custom_minimum_size = Vector2(220, 50)
+	act_row.add_child(act_b)
 
 
 func _update_hud() -> void:
